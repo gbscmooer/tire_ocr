@@ -478,8 +478,12 @@ class TireOCR:
             
         print(f"  提取编号区域ROI: 位置({x_start},{y_start})-({x_end},{y_end}), 尺寸={self.label_roi_image.shape}")
         
-        # 在编号区域内提取二值化字符（改进版，针对点阵字符）
-        label_gray = cv2.cvtColor(self.label_roi_image, cv2.COLOR_BGR2GRAY)
+        # 重要：原图是逆时针旋转90度的垂直方向，需要顺时针旋转90度变成正常水平方向
+        # 这样从左到右就是字符序列的总长，上下就是字符高度
+        label_roi_rotated = cv2.rotate(self.label_roi_image, cv2.ROTATE_90_CLOCKWISE)
+        
+        # 在旋转后的编号区域内提取二值化字符
+        label_gray = cv2.cvtColor(label_roi_rotated, cv2.COLOR_BGR2GRAY)
         
         # 增强对比度
         label_enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(label_gray)
@@ -505,8 +509,11 @@ class TireOCR:
         
         self.label_binary = label_binary
         
-        # 保存中间结果
+        # 保存旋转后的中间结果（用于后续分割）
         cv2.imwrite(os.path.join(self.output_dir, "4_label_binary.png"), self.label_binary)
+        
+        # 也保存旋转后的彩色ROI用于可视化
+        cv2.imwrite(os.path.join(self.output_dir, "4_label_roi_rotated.png"), label_roi_rotated)
         
         return self.label_binary
     
@@ -548,8 +555,8 @@ class TireOCR:
     def stage3_character_segmentation(self) -> List[np.ndarray]:
         """
         第三阶段：字符区域分割
-        1. 在标签区域内进行垂直投影分析，寻找字符间的切割点
-        2. 针对点阵字符特征调整过滤条件（点阵字符通常非常窄）
+        1. 使用连通域分析找到独立的字符区域
+        2. 针对点阵字符特征调整过滤条件
         3. 归一化处理 (64x64)，但不进行字符识别
         
         Returns:
@@ -565,110 +572,109 @@ class TireOCR:
         binary = self.label_binary.copy()
         height, width = binary.shape
         
-        # 1. 垂直投影分析 - 针对点阵字符调整
-        # 计算每列的白色像素数量（字符像素）
-        vertical_projection = np.sum(binary > 0, axis=0)
+        # 1. 使用连通域分析找到独立的字符区域
+        # 先进行一些形态学操作，确保字符内部连接良好
+        kernel = np.ones((3, 3), np.uint8)
+        binary_processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
         
-        # 寻找字符之间的空白列（切割点）
-        # 对于点阵字符，空白列的阈值可以更小，因为字符本身很窄
-        blank_threshold = height * 0.05  # 降低到5%
-        print(f"    空白列阈值: {blank_threshold}")
+        # 寻找连通域
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_processed, connectivity=8)
         
-        # 另外，如果整个列都是白色（垂直投影值等于高度），可能是背景噪声
-        # 将这些列也视为空白
-        full_white_cols = vertical_projection == height
-        is_blank = (vertical_projection < blank_threshold) | full_white_cols
+        print(f"  找到 {num_labels-1} 个连通域 (排除背景)")
         
-        print(f"    空白列数量: {is_blank.sum()}/{len(is_blank)}")
-        
-        # 生成切割区间
-        cut_positions = []
-        in_char = False
-        start = 0
-        
-        for i in range(width):
-            if not is_blank[i] and not in_char:
-                # 字符开始
-                start = i
-                in_char = True
-            elif is_blank[i] and in_char:
-                # 字符结束
-                end = i
-                if end - start >= 1:  # 最小宽度：1个像素（点阵字符可能只有1-2像素宽）
-                    cut_positions.append((start, end))
-                in_char = False
-        
-        # 如果最后一个字符延伸到末尾
-        if in_char and width - start >= 1:
-            cut_positions.append((start, width))
-        
-        print(f"  初步找到 {len(cut_positions)} 个候选字符区域")
-        
-        # 2. 连通域过滤 - 针对点阵字符调整
         self.segmented_chars = []
         self.char_positions = []
         
-        for idx, (left, right) in enumerate(cut_positions):
-            # 提取字符区域
-            char_region = binary[:, left:right]
+        # 遍历所有连通域（跳过背景，索引0）
+        for label in range(1, num_labels):
+            # 获取连通域的统计信息
+            x = stats[label, cv2.CC_STAT_LEFT]
+            y = stats[label, cv2.CC_STAT_TOP]
+            w = stats[label, cv2.CC_STAT_WIDTH]
+            h = stats[label, cv2.CC_STAT_HEIGHT]
+            area = stats[label, cv2.CC_STAT_AREA]
             
-            # 水平投影，裁剪上下空白
-            horizontal_projection = np.sum(char_region > 0, axis=1)
-            # 对于点阵字符，水平空白阈值可以更低
-            h_blank_threshold = max(1, (right - left) * 0.05)  # 降低到5%
-            top = 0
-            bottom = height - 1
-            
-            # 寻找上边界
-            for i in range(height):
-                if horizontal_projection[i] > h_blank_threshold:
-                    top = max(0, i - 1)  # 稍微扩大一点
-                    break
-            
-            # 寻找下边界
-            for i in range(height - 1, -1, -1):
-                if horizontal_projection[i] > h_blank_threshold:
-                    bottom = min(height - 1, i + 1)
-                    break
-            
-            # 提取字符图像
-            char_img = binary[top:bottom+1, left:right]
-            
-            # 检查字符图像是否有效
-            if char_img.size == 0:
-                print(f"    跳过区域 {idx}: 字符图像为空")
-                continue
-                
-            char_height, char_width = char_img.shape
-            
-            # 点阵字符可能非常窄，所以降低最小宽度要求
-            if char_height < 3 or char_width < 1:  # 最小高度3像素，最小宽度1像素
-                print(f"    跳过区域 {idx}: 尺寸过小 ({char_width}x{char_height})")
+            # 检查连通域是否有效
+            if area < 50:  # 最小面积50像素
+                print(f"    跳过连通域 {label}: 面积过小 {area}")
                 continue
             
-            aspect_ratio = char_width / char_height
-            area = char_height * char_width
+            # 计算宽高比
+            if h == 0:
+                continue
+            aspect_ratio = w / h
             
-            # 点阵字符的宽高比通常很小（0.001-0.3），因为它们是垂直排列的点
-            # 放宽宽高比限制
-            min_aspect_ratio = 0.001  # 允许非常窄的字符（之前是0.005）
-            max_aspect_ratio = 0.5    # 点阵字符不会太宽
+            # 正立字符的宽高比通常在0.3到3.0之间
+            min_aspect_ratio = 0.3   # 最小宽高比（较窄字符）
+            max_aspect_ratio = 3.0   # 最大宽高比（较宽字符）
             
             if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
-                print(f"    跳过区域 {idx}: 宽高比异常 {aspect_ratio:.3f} (期望: {min_aspect_ratio:.3f}-{max_aspect_ratio:.3f})")
+                print(f"    跳过连通域 {label}: 宽高比异常 {aspect_ratio:.3f}")
                 continue
             
-            # 面积过滤 - 点阵字符面积可能很小
-            min_area = 5  # 最小面积5像素
-            if area < min_area:
-                print(f"    跳过区域 {idx}: 面积过小 {area} (最小: {min_area})")
+            # 提取字符图像
+            char_img = binary[y:y+h, x:x+w]
+            
+            # 确保图像有效
+            if char_img.size == 0:
+                print(f"    跳过连通域 {label}: 字符图像为空")
                 continue
             
-            # 3. 归一化处理 (64x64)
-            normalized_char = self._normalize_char(char_img)
+            # 裁剪上下左右的空白
+            # 水平投影，裁剪上下空白
+            horizontal_projection = np.sum(char_img > 0, axis=1)
+            h_blank_threshold = max(1, w * 0.05)
+            top = 0
+            bottom = h - 1
+            
+            for i in range(h):
+                if horizontal_projection[i] > h_blank_threshold:
+                    top = max(0, i - 1)
+                    break
+            
+            for i in range(h - 1, -1, -1):
+                if horizontal_projection[i] > h_blank_threshold:
+                    bottom = min(h - 1, i + 1)
+                    break
+            
+            # 垂直投影，裁剪左右空白
+            vertical_projection = np.sum(char_img > 0, axis=0)
+            v_blank_threshold = max(1, (bottom - top + 1) * 0.05)
+            left_crop = 0
+            right_crop = w - 1
+            
+            for i in range(w):
+                if vertical_projection[i] > v_blank_threshold:
+                    left_crop = max(0, i - 1)
+                    break
+            
+            for i in range(w - 1, -1, -1):
+                if vertical_projection[i] > v_blank_threshold:
+                    right_crop = min(w - 1, i + 1)
+                    break
+            
+            # 重新计算裁剪后的尺寸
+            crop_height = bottom - top + 1
+            crop_width = right_crop - left_crop + 1
+            
+            if crop_height < 3 or crop_width < 3:
+                print(f"    跳过连通域 {label}: 裁剪后尺寸过小 ({crop_width}x{crop_height})")
+                continue
+            
+            # 提取裁剪后的字符
+            cropped_char = char_img[top:bottom+1, left_crop:right_crop+1]
+            
+            # 更新位置信息（相对于原始label_binary）
+            final_left = x + left_crop
+            final_top = y + top
+            final_right = x + left_crop + crop_width
+            final_bottom = y + top + crop_height
+            
+            # 归一化处理 (64x64)
+            normalized_char = self._normalize_char(cropped_char)
             
             self.segmented_chars.append(normalized_char)
-            self.char_positions.append((left, top, right, bottom))
+            self.char_positions.append((final_left, final_top, final_right, final_bottom))
         
         print(f"  分割出 {len(self.segmented_chars)} 个有效字符区域")
         
