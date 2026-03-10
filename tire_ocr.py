@@ -225,7 +225,81 @@ class TireOCR:
         # 提取整个高度的胎面区域
         self.tread_roi_image = self.original_image[:, left_bound:right_bound]
         
-        # 3. 图像增强
+        # 3. 处理上下边界
+        # 获取胎面区域的二进制图像部分
+        tread_binary = self.binary_image[:, left_bound:right_bound]
+        tread_height, tread_width = tread_binary.shape
+        
+        print("  处理上下边界...")
+        
+        # 上边界：从上往下扫描行，寻找真正的胎面边缘
+        # 胎面区域应该是黑色像素比例很高的区域
+        # 我们需要找到从背景（黑色像素低）到胎面（黑色像素高）的过渡
+        # 但实际上，图像已经裁剪到胎面区域，所以我们需要找胎面的真正上下边缘
+        
+        # 方法：寻找连续多行黑色像素比例 < 90% 的区域，认为是胎面边缘
+        top_bound = 0
+        consecutive_low_black_rows = 0
+        threshold_low_black = 0.90  # 黑色像素比例低于90%认为是边缘
+        
+        for y in range(tread_height):
+            black_pixels = np.sum(tread_binary[y, :] == 0)
+            black_ratio = black_pixels / tread_width
+            
+            if black_ratio < threshold_low_black:
+                consecutive_low_black_rows += 1
+                if consecutive_low_black_rows >= 5:  # 连续5行黑色像素都低，认为是上边界
+                    top_bound = y - 2  # 取最早的一行
+                    print(f"    发现上边界: y={top_bound}, 连续{consecutive_low_black_rows}行黑色像素<{threshold_low_black}")
+                    break
+            else:
+                consecutive_low_black_rows = 0  # 重置计数
+        
+        # 如果没找到明显的边界，使用默认值
+        if top_bound == 0:
+            print("    未发现明显上边界，使用默认上边界")
+            top_bound = 0
+        
+        # 下边界：从下往上扫描行
+        bottom_bound = tread_height - 1
+        consecutive_low_black_rows = 0
+        
+        for y in range(tread_height - 1, -1, -1):
+            black_pixels = np.sum(tread_binary[y, :] == 0)
+            black_ratio = black_pixels / tread_width
+            
+            if black_ratio < threshold_low_black:
+                consecutive_low_black_rows += 1
+                if consecutive_low_black_rows >= 5:  # 连续5行黑色像素都低，认为是下边界
+                    bottom_bound = y + 2  # 取最早的一行
+                    print(f"    发现下边界: y={bottom_bound}, 连续{consecutive_low_black_rows}行黑色像素<{threshold_low_black}")
+                    break
+            else:
+                consecutive_low_black_rows = 0  # 重置计数
+        
+        # 如果没找到明显的边界，使用默认值
+        if bottom_bound == tread_height - 1:
+            print("    未发现明显下边界，使用默认下边界")
+            bottom_bound = tread_height - 1
+        
+        # 检查边界是否有效
+        if bottom_bound <= top_bound:
+            print("  警告: 上下边界异常，使用默认边界")
+            top_bound = 0
+            bottom_bound = tread_height - 1
+        
+        # 上下边界分别向外扩展几个像素
+        expand_top = 20
+        expand_bottom = 20
+        top_bound = max(0, top_bound - expand_top)
+        bottom_bound = min(tread_height - 1, bottom_bound + expand_bottom)
+        
+        print(f"  扩展后的上下边界: 上边界={top_bound}, 下边界={bottom_bound}, 高度={bottom_bound-top_bound+1}")
+        
+        # 使用新的上下边界裁剪胎面区域
+        self.tread_roi_image = self.tread_roi_image[top_bound:bottom_bound+1, :]
+        
+        # 4. 图像增强
         # 灰度化
         roi_gray = cv2.cvtColor(self.tread_roi_image, cv2.COLOR_BGR2GRAY)
         
@@ -235,6 +309,10 @@ class TireOCR:
         
         # 保存中间结果
         cv2.imwrite(os.path.join(self.output_dir, "1_binary.png"), self.binary_image)
+        
+        # 保存裁剪前的胎面区域用于对比
+        tread_full_height = self.original_image[:, left_bound:right_bound]
+        cv2.imwrite(os.path.join(self.output_dir, "2_roi_full.png"), tread_full_height)
         cv2.imwrite(os.path.join(self.output_dir, "2_roi.png"), self.tread_roi_image)
         cv2.imwrite(os.path.join(self.output_dir, "3_enhanced.png"), self.enhanced_image)
         
@@ -274,11 +352,11 @@ class TireOCR:
         plt.savefig(os.path.join(self.output_dir, "stage1_result.png"), dpi=150)
         plt.show()
     
-    # ==================== 第二阶段：标签区域定位（重构版） ====================
+    # ==================== 第二阶段：标签区域定位（优先使用第一阶段结果） ====================
     def stage2_label_localization(self) -> Optional[np.ndarray]:
         """
-        第二阶段：在胎面ROI内部直接定位编号区域（白色文字区域）
-        基于第一阶段已经找到的编号区域位置，直接提取该区域进行处理
+        第二阶段：在胎面ROI内部定位编号区域（白色文字区域）
+        优先使用第一阶段找到的编号区域位置，如果不可用则使用亮度分析
         
         Returns:
             标签区域二值化图像，若无标签则返回 None
@@ -290,20 +368,82 @@ class TireOCR:
         
         height, width = self.enhanced_image.shape
         
-        # 检查是否已经有编号区域的相对位置信息
-        if self.label_left_relative is None or self.label_right_relative is None:
-            print("  错误: 未找到编号区域的相对位置信息")
-            return None
+        # 优先使用第一阶段保存的编号区域位置
+        start = None
+        end = None
         
-        # 使用第一阶段保存的编号区域位置
-        start = self.label_left_relative
-        end = self.label_right_relative
-        label_width = end - start
-        
-        print(f"  使用第一阶段定位的编号区域: 列 {start}-{end}, 宽度={label_width}")
+        if self.label_left_relative is not None and self.label_right_relative is not None:
+            start = self.label_left_relative
+            end = self.label_right_relative
+            label_width = end - start
+            print(f"  使用第一阶段定位的编号区域: 列 {start}-{end}, 宽度={label_width}")
+        else:
+            # 如果第一阶段没有找到编号区域，使用亮度分析
+            print("  使用亮度分析定位编号区域...")
+            
+            # 分析每列的亮度特征
+            col_means = np.mean(self.enhanced_image, axis=0)
+            
+            # 寻找亮度明显高于平均的区域（编号区域是白色点阵，应该比较亮）
+            mean_brightness = np.mean(col_means)
+            std_brightness = np.std(col_means)
+            bright_threshold = mean_brightness + std_brightness * 0.3
+            
+            # 标记亮列
+            bright_cols = np.where(col_means > bright_threshold)[0]
+            print(f"    亮度阈值: {bright_threshold:.1f}, 亮列数量: {len(bright_cols)}")
+            
+            if len(bright_cols) == 0:
+                print("    未找到明显的高亮列")
+                return None
+            
+            # 找到连续的亮列区域（可能的编号区域）
+            bright_regions = []
+            if len(bright_cols) > 0:
+                current_start = bright_cols[0]
+                current_end = bright_cols[0]
+                
+                for i in range(1, len(bright_cols)):
+                    if bright_cols[i] == bright_cols[i-1] + 1:
+                        current_end = bright_cols[i]
+                    else:
+                        region_width = current_end - current_start + 1
+                        if region_width >= 10:  # 最小宽度10像素
+                            bright_regions.append((current_start, current_end, region_width))
+                        current_start = bright_cols[i]
+                        current_end = bright_cols[i]
+                
+                # 添加最后一个区域
+                region_width = current_end - current_start + 1
+                if region_width >= 10:
+                    bright_regions.append((current_start, current_end, region_width))
+            
+            if not bright_regions:
+                print("    未找到足够宽的高亮区域")
+                return None
+            
+            # 选择最可能是编号区域的区域
+            print(f"    找到 {len(bright_regions)} 个候选区域:")
+            region_scores = []
+            
+            for i, (s, e, region_width) in enumerate(bright_regions):
+                avg_brightness = np.mean(col_means[s:e+1])
+                # 评分：宽度 * 平均亮度 * (1 - |宽度-40|/100) [鼓励宽度接近40像素]
+                width_penalty = 1 - abs(region_width - 40) / 100
+                score = region_width * avg_brightness * max(0.1, width_penalty)
+                region_scores.append((i, s, e, region_width, avg_brightness, score))
+                print(f"      区域 {i}: 列 {s}-{e}, 宽度={region_width}, 亮度={avg_brightness:.1f}, 得分={score:.1f}")
+            
+            # 选择得分最高的区域
+            region_scores.sort(key=lambda x: x[5], reverse=True)
+            best_idx, s, e, region_width, avg_brightness, score = region_scores[0]
+            print(f"    选择区域 {best_idx}: 列 {s}-{e}, 宽度={region_width}, 亮度={avg_brightness:.1f}")
+            
+            start = s
+            end = e
         
         # 扩展区域以确保包含整个编号区域
-        margin = 10  # 扩展边界
+        margin = 15  # 扩展边界
         x_start = max(0, start - margin)
         x_end = min(width - 1, end + margin)
         
@@ -351,26 +491,7 @@ class TireOCR:
         
         self.label_binary = label_binary
         
-        # 保存中间结果
-        # 为了可视化，仍然计算亮度分析
-        col_means = np.mean(self.enhanced_image, axis=0)
-        brightness_plot = np.zeros((100, width), dtype=np.uint8)
-        for col in range(width):
-            brightness_value = int((col_means[col] - np.min(col_means)) / (np.max(col_means) - np.min(col_means)) * 100)
-            brightness_plot[:brightness_value, col] = 255
-        
-        # 标记选中的区域
-        cv2.rectangle(brightness_plot, (x_start, 0), (x_end, 99), 128, 2)
-        
-        cv2.imwrite(os.path.join(self.output_dir, "4_brightness_analysis.png"), brightness_plot)
-        cv2.imwrite(os.path.join(self.output_dir, "5_label_roi.png"), self.label_roi_image)
-        cv2.imwrite(os.path.join(self.output_dir, "6_label_binary.png"), self.label_binary)
-        
-        # 在原图上绘制编号区域
-        tread_with_label = self.tread_roi_image.copy()
-        cv2.rectangle(tread_with_label, (x_start, y_start), (x_end, y_end), (0, 255, 0), 3)
-        cv2.imwrite(os.path.join(self.output_dir, "7_tread_with_label.png"), tread_with_label)
-        
+        # 暂时不保存中间结果，后续将重构处理逻辑
         return self.label_binary
     
     def stage2_visualize(self):
@@ -543,17 +664,8 @@ class TireOCR:
             
             self.segmented_chars.append(normalized_char)
             self.char_positions.append((left, top, right, bottom))
-            
-            # 保存单个字符
-            cv2.imwrite(os.path.join(self.output_dir, f"char_{idx:02d}.png"), normalized_char)
         
         print(f"  分割出 {len(self.segmented_chars)} 个有效字符区域")
-        
-        # 保存字符位置信息
-        with open(os.path.join(self.output_dir, "char_positions.txt"), "w") as f:
-            for idx, (left, top, right, bottom) in enumerate(self.char_positions):
-                f.write(f"Char {idx}: ({left}, {top}) - ({right}, {bottom}) "
-                       f"Size: {right-left}x{bottom-top}\n")
         
         return self.segmented_chars
     
@@ -755,14 +867,9 @@ def main():
         print("  - 1_binary.png: 二值化图像")
         print("  - 2_roi.png: 胎面区域")
         print("  - 3_enhanced.png: CLAHE 增强图像")
-        print("  - 4_adaptive_binary.png: 自适应二值化标签区域")
-        print("  - 5_morph_vertical.png: 垂直形态学处理结果")
-        print("  - 6_label_roi.png: 标签区域")
-        print("  - 7_label_binary.png: 标签二值化图像")
-        print("  - 8_tread_with_label.png: 带标签标记的胎面图像")
-        if ocr.segmented_chars:
-            print(f"  - char_*.png: 分割出的字符图像")
         print("  - stage1_result.png: 第一阶段可视化对比图")
+        
+        print(f"\n第二、第三阶段输出已暂停，等待重构")
         
     except Exception as e:
         print(f"处理失败: {e}")
