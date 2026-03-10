@@ -3,6 +3,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
+import random
 
 class TireOCR:
     """橡胶胎面点阵字符识别主类"""
@@ -35,6 +36,12 @@ class TireOCR:
         self.tread_right_global = None      # 胎面区域在原始图像中的右边界
         self.label_left_relative = None     # 编号区域在胎面ROI中的相对左偏移
         self.label_right_relative = None    # 编号区域在胎面ROI中的相对右偏移
+
+        # 字符识别相关
+        self.classifier = None              # 训练好的分类器 (SVM)
+        self.hog_descriptor = None          # HOG 特征描述器
+        self.class_labels = []              # 类别标签
+        self.is_trained = False
     
     # ==================== 第一阶段：ROI 提取与预处理 ====================
     def stage1_extract_roi(self, image_path: str) -> np.ndarray:
@@ -471,7 +478,7 @@ class TireOCR:
             
         print(f"  提取编号区域ROI: 位置({x_start},{y_start})-({x_end},{y_end}), 尺寸={self.label_roi_image.shape}")
         
-        # 在编号区域内提取二值化字符
+        # 在编号区域内提取二值化字符（改进版，针对点阵字符）
         label_gray = cv2.cvtColor(self.label_roi_image, cv2.COLOR_BGR2GRAY)
         
         # 增强对比度
@@ -489,51 +496,49 @@ class TireOCR:
         if white_pixels < black_pixels:  # 如果字符是黑色，背景是白色
             label_binary = cv2.bitwise_not(label_binary)
         
+        # 形态学闭运算，连接离散的点阵字符
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # 可选：开运算去除小噪声
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        
         self.label_binary = label_binary
         
-        # 暂时不保存中间结果，后续将重构处理逻辑
+        # 保存中间结果
+        cv2.imwrite(os.path.join(self.output_dir, "4_label_binary.png"), self.label_binary)
+        
         return self.label_binary
     
     def stage2_visualize(self):
         """可视化第二阶段处理结果"""
-        if self.enhanced_image is None or self.tophat_image is None:
-            print("请先运行 stage2_morphological_reconstruction()")
+        if self.enhanced_image is None or self.label_binary is None:
+            print("请先运行 stage2_label_localization()")
             return
         
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
         # Enhanced image
         axes[0, 0].imshow(self.enhanced_image, cmap='gray')
         axes[0, 0].set_title("Enhanced Image (Input)")
         axes[0, 0].axis('off')
         
-        # Top-Hat transform result
-        axes[0, 1].imshow(self.tophat_image, cmap='gray')
-        axes[0, 1].set_title("Top-Hat Transform")
-        axes[0, 1].axis('off')
+        # Label ROI image
+        if self.label_roi_image is not None:
+            axes[0, 1].imshow(cv2.cvtColor(self.label_roi_image, cv2.COLOR_BGR2RGB))
+            axes[0, 1].set_title("Label Region ROI")
+            axes[0, 1].axis('off')
         
-        # Morphological processing result
-        if self.morph_image is not None:
-            axes[0, 2].imshow(self.morph_image, cmap='gray')
-            axes[0, 2].set_title("Morphological Closing")
-            axes[0, 2].axis('off')
-        
-        # Adaptive threshold result
-        if hasattr(self, 'binary_chars') and self.binary_chars is not None:
-            axes[1, 0].imshow(self.binary_chars, cmap='gray')
-            axes[1, 0].set_title("Adaptive Threshold")
-            axes[1, 0].axis('off')
+        # Binary label result
+        axes[1, 0].imshow(self.label_binary, cmap='gray')
+        axes[1, 0].set_title("Binary Label (after morphology)")
+        axes[1, 0].axis('off')
         
         # Histogram analysis
         axes[1, 1].hist(self.enhanced_image.ravel(), 256, [0, 256])
         axes[1, 1].set_title("Enhanced Image Histogram")
         axes[1, 1].set_xlabel("Pixel Value")
         axes[1, 1].set_ylabel("Frequency")
-        
-        axes[1, 2].hist(self.tophat_image.ravel(), 256, [0, 256])
-        axes[1, 2].set_title("Top-Hat Histogram")
-        axes[1, 2].set_xlabel("Pixel Value")
-        axes[1, 2].set_ylabel("Frequency")
         
         plt.tight_layout()
         plt.savefig(os.path.join(self.output_dir, "stage2_result.png"), dpi=150)
@@ -644,9 +649,9 @@ class TireOCR:
             aspect_ratio = char_width / char_height
             area = char_height * char_width
             
-            # 点阵字符的宽高比通常很小（0.01-0.3），因为它们是垂直排列的点
+            # 点阵字符的宽高比通常很小（0.001-0.3），因为它们是垂直排列的点
             # 放宽宽高比限制
-            min_aspect_ratio = 0.005  # 允许非常窄的字符
+            min_aspect_ratio = 0.001  # 允许非常窄的字符（之前是0.005）
             max_aspect_ratio = 0.5    # 点阵字符不会太宽
             
             if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
@@ -666,6 +671,16 @@ class TireOCR:
             self.char_positions.append((left, top, right, bottom))
         
         print(f"  分割出 {len(self.segmented_chars)} 个有效字符区域")
+        
+        # 保存分割结果图像
+        if self.segmented_chars:
+            # 绘制带有边界框的图像
+            img_with_boxes = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
+            for idx, (left, top, right, bottom) in enumerate(self.char_positions):
+                cv2.rectangle(img_with_boxes, (left, top), (right, bottom), (0, 255, 0), 2)
+                cv2.putText(img_with_boxes, str(idx), (left, top-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            cv2.imwrite(os.path.join(self.output_dir, "5_segmented_chars.png"), img_with_boxes)
         
         return self.segmented_chars
     
@@ -725,13 +740,13 @@ class TireOCR:
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
         # 1. Original binary character image
-        if hasattr(self, 'binary_chars') and self.binary_chars is not None:
-            axes[0, 0].imshow(self.binary_chars, cmap='gray')
-            axes[0, 0].set_title("Binary Character Image")
+        if self.label_binary is not None:
+            axes[0, 0].imshow(self.label_binary, cmap='gray')
+            axes[0, 0].set_title("Binary Label Image")
             axes[0, 0].axis('off')
             
             # Draw character bounding boxes on image
-            img_with_boxes = cv2.cvtColor(self.binary_chars, cv2.COLOR_GRAY2RGB)
+            img_with_boxes = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
             for idx, (left, top, right, bottom) in enumerate(self.char_positions):
                 cv2.rectangle(img_with_boxes, (left, top), (right, bottom), (0, 255, 0), 2)
                 cv2.putText(img_with_boxes, str(idx), (left, top-5), 
@@ -779,23 +794,165 @@ class TireOCR:
         plt.savefig(os.path.join(self.output_dir, "stage3_result.png"), dpi=150)
         plt.show()
     
-    # ==================== 第四阶段：CNN 识别模块 ====================
-    def stage4_cnn_recognition(self, char_images: List[np.ndarray]) -> str:
+    # ==================== 第四阶段：传统字符识别 (HOG+SVM) ====================
+    def _generate_synthetic_dataset(self, num_samples_per_char: int = 30) -> Tuple[np.ndarray, np.ndarray]:
         """
-        第四阶段：CNN 识别
-        1. 加载/构建轻量级 CNN 模型
-        2. 对字符图像进行分类
-        3. 输出识别字符串
-        
+        生成合成点阵字符数据集
         Args:
-            char_images: 字符图像列表
+            num_samples_per_char: 每个字符生成的样本数量
+        
+        Returns:
+            images: 归一化后的字符图像列表
+            labels: 对应的标签（0-9, A-Z 映射为 0-35）
+        """
+        chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        char_to_label = {char: idx for idx, char in enumerate(chars)}
+        
+        images = []
+        labels = []
+        
+        # 创建空白图像用于绘制
+        canvas_size = 64
+        font_choices = [
+            cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.FONT_HERSHEY_PLAIN,
+            cv2.FONT_HERSHEY_DUPLEX,
+            cv2.FONT_HERSHEY_COMPLEX,
+            cv2.FONT_HERSHEY_TRIPLEX
+        ]
+        
+        print(f"  生成合成字符数据集 ({len(chars)} 个字符，每个 {num_samples_per_char} 个样本)...")
+        
+        for char in chars:
+            for sample_idx in range(num_samples_per_char):
+                # 随机选择字体和大小
+                font = random.choice(font_choices)
+                font_scale = random.uniform(1.5, 3.0)
+                thickness = random.randint(1, 3)
+                
+                # 创建空白图像（黑色背景）
+                img = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+                
+                # 计算文本大小和位置
+                (text_width, text_height), baseline = cv2.getTextSize(char, font, font_scale, thickness)
+                x = (canvas_size - text_width) // 2
+                y = (canvas_size + text_height) // 2
+                
+                # 绘制白色字符
+                cv2.putText(img, char, (x, y), font, font_scale, 255, thickness)
+                
+                # 添加噪声以模拟真实点阵字符
+                # 1. 随机点阵化：将部分像素设为0（模拟点阵缺失）
+                mask = np.random.random((canvas_size, canvas_size)) > 0.85  # 15% 的像素被移除
+                img[mask] = 0
+                
+                # 2. 添加高斯噪声
+                noise = np.random.normal(0, 10, (canvas_size, canvas_size)).astype(np.int32)
+                img = np.clip(img.astype(np.int32) + noise, 0, 255).astype(np.uint8)
+                
+                # 3. 形态学操作模拟点阵
+                kernel_size = random.choice([1, 3])
+                if kernel_size > 1:
+                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                    img = cv2.erode(img, kernel, iterations=1)
+                
+                # 4. 二值化
+                _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+                
+                images.append(img)
+                labels.append(char_to_label[char])
+        
+        return np.array(images), np.array(labels)
+    
+    def _extract_hog_features(self, images: np.ndarray) -> np.ndarray:
+        """
+        提取 HOG 特征
+        Args:
+            images: 归一化后的字符图像列表
+        
+        Returns:
+            hog_features: HOG 特征向量
+        """
+        if self.hog_descriptor is None:
+            # 初始化 HOG 描述器
+            winSize = (64, 64)
+            blockSize = (16, 16)
+            blockStride = (8, 8)
+            cellSize = (8, 8)
+            nbins = 9
             
+            self.hog_descriptor = cv2.HOGDescriptor(winSize, blockSize, blockStride, cellSize, nbins)
+        
+        hog_features = []
+        for img in images:
+            # 计算 HOG 特征
+            hog_feature = self.hog_descriptor.compute(img)
+            hog_features.append(hog_feature.flatten())
+        
+        return np.array(hog_features)
+    
+    def _train_classifier(self, num_samples_per_char: int = 30):
+        """
+        训练 HOG+SVM 分类器
+        """
+        print("  训练 HOG+SVM 分类器...")
+        
+        # 生成合成数据集
+        images, labels = self._generate_synthetic_dataset(num_samples_per_char)
+        
+        # 提取 HOG 特征
+        features = self._extract_hog_features(images)
+        
+        # 训练 SVM
+        svm = cv2.ml.SVM_create()
+        svm.setType(cv2.ml.SVM_C_SVC)
+        svm.setKernel(cv2.ml.SVM_LINEAR)
+        svm.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 1000, 1e-6))
+        
+        svm.train(features.astype(np.float32), cv2.ml.ROW_SAMPLE, labels.astype(np.int32))
+        
+        self.classifier = svm
+        self.class_labels = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        self.is_trained = True
+        
+        print(f"  分类器训练完成，支持 {len(self.class_labels)} 个字符")
+    
+    def stage4_hog_svm_recognition(self, char_images: List[np.ndarray]) -> str:
+        """
+        第四阶段：使用 HOG+SVM 进行字符识别
+        Args:
+            char_images: 归一化后的字符图像列表
+        
         Returns:
             识别出的字符串
         """
-        # 待实现
-        pass
+        if not self.is_trained:
+            self._train_classifier()
+        
+        if not char_images:
+            return ""
+        
+        # 准备输入图像
+        images_array = np.array(char_images)
+        
+        # 提取 HOG 特征
+        features = self._extract_hog_features(images_array)
+        
+        # 预测
+        _, predictions = self.classifier.predict(features.astype(np.float32))
+        predictions = predictions.flatten().astype(int)
+        
+        # 转换为字符
+        result = ""
+        for pred in predictions:
+            if 0 <= pred < len(self.class_labels):
+                result += self.class_labels[pred]
+            else:
+                result += "?"
+        
+        return result
     
+    # ==================== 完整处理流程 ====================
     def full_pipeline(self, image_path: str) -> str:
         """
         完整处理流程（重构版）
@@ -803,7 +960,7 @@ class TireOCR:
             image_path: 输入图像路径
             
         Returns:
-            识别出的字符串（暂为空字符串，仅完成区域划分）
+            识别出的字符串
         """
         print("=== 开始处理图像 ===")
         # 第一阶段：胎面 ROI 提取
@@ -820,6 +977,7 @@ class TireOCR:
             print("第二阶段完成: 找到标签区域")
         else:
             print("第二阶段完成: 未发现标签区域")
+            return "无标签"
         
         # 第三阶段：字符区域分割
         char_images = self.stage3_character_segmentation()
@@ -827,10 +985,59 @@ class TireOCR:
             print(f"第三阶段完成: 分割出 {len(char_images)} 个字符区域")
         else:
             print("第三阶段完成: 无字符区域可分割")
+            return "无字符"
         
-        # 第四阶段：CNN 识别（暂不实现）
-        result = ""  # 暂时返回空字符串
-        print("第四阶段跳过: 字符识别功能暂未实现")
+        # 第四阶段：HOG+SVM 识别
+        result = self.stage4_hog_svm_recognition(char_images)
+        print(f"第四阶段完成: 识别结果 = '{result}'")
+        
+        # 保存最终结果图像
+        self._save_final_result(result)
+        
+        return result
+    
+    def _save_final_result(self, result: str):
+        """保存最终识别结果图像"""
+        if self.label_binary is None or not self.char_positions:
+            return
+        
+        # 创建结果图像
+        result_img = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
+        
+        # 绘制边界框和标签
+        for idx, (left, top, right, bottom) in enumerate(self.char_positions):
+            cv2.rectangle(result_img, (left, top), (right, bottom), (0, 255, 0), 2)
+            if idx < len(result):
+                cv2.putText(result_img, result[idx], (left, top-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        # 添加整体识别结果文本
+        cv2.putText(result_img, f"识别结果: {result}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        
+        cv2.imwrite(os.path.join(self.output_dir, "6_final_result.png"), result_img)
+        print(f"  最终结果已保存到 {self.output_dir}/6_final_result.png")
+    
+    def run_and_visualize(self, image_path: str):
+        """
+        运行完整流程并可视化所有结果
+        """
+        result = self.full_pipeline(image_path)
+        
+        # 可视化各阶段结果
+        if hasattr(self, 'original_image') and self.original_image is not None:
+            self.stage1_visualize()
+        
+        if hasattr(self, 'label_binary') and self.label_binary is not None:
+            self.stage2_visualize()
+        
+        if self.segmented_chars:
+            self.stage3_visualize()
+        
+        print(f"\n=== 处理完成 ===")
+        print(f"原始图像: {image_path}")
+        print(f"识别结果: {result}")
+        print(f"中间结果保存在: {self.output_dir}/")
         
         return result
 
@@ -852,24 +1059,7 @@ def main():
     
     try:
         # 执行完整流程
-        result = ocr.full_pipeline(image_path)
-        print(f"\n完整处理流程完成!")
-        print(f"原始图像尺寸: {ocr.original_image.shape}")
-        print(f"胎面区域尺寸: {ocr.tread_roi_image.shape}")
-        if ocr.label_roi_image is not None:
-            print(f"标签区域尺寸: {ocr.label_roi_image.shape}")
-        print(f"分割出的字符数量: {len(ocr.segmented_chars)}")
-        
-        # 显示结果
-        ocr.stage1_visualize()
-        
-        print(f"\n中间结果已保存到 {ocr.output_dir}/ 目录:")
-        print("  - 1_binary.png: 二值化图像")
-        print("  - 2_roi.png: 胎面区域")
-        print("  - 3_enhanced.png: CLAHE 增强图像")
-        print("  - stage1_result.png: 第一阶段可视化对比图")
-        
-        print(f"\n第二、第三阶段输出已暂停，等待重构")
+        result = ocr.run_and_visualize(image_path)
         
     except Exception as e:
         print(f"处理失败: {e}")
