@@ -49,13 +49,13 @@ class TireOCR:
         第一阶段：ROI 提取与预处理
         1. 全局二值化（Otsu）得到黑白图像（胎面为黑0，背景为白255）
         2. 从图像中心 x = 宽度/2 向两边扫描，找到黑色胎面区域的左右边界
-        3. 提取胎面 ROI 并灰度化 + CLAHE 增强
+        3. 提取胎面 ROI 并灰度化 + 全局二值化 + 顺时针旋转90度
         
         Args:
             image_path: 输入图像路径
         
         Returns:
-            胎面 ROI 增强后的图像
+            胎面 ROI 增强后的图像 (尺寸: 2396x229)
         """
         # 读取图像
         self.original_image = cv2.imread(image_path)
@@ -68,7 +68,7 @@ class TireOCR:
         
         # 2. 使用中心向左扫描找到编号区域（白色文字区域），然后基于编号区域锁定整个胎面区域
         height, width = self.binary_image.shape
-        center_x = width // 2
+        center_x = (width // 2 ) -120  # 从中心向左偏移120像素开始扫描，避免中心可能的白色区域干扰
         
         # 第一步：找到编号区域（白色文字区域）的左右边界
         label_left = None
@@ -85,14 +85,14 @@ class TireOCR:
             black_ratio = black_pixels / height
             
             if state == 0:
-                if black_ratio < 0.05:
+                if black_ratio < 0.01:
                     # 遇到无关白色边缘，说明没有编号区域
                     print("  未发现编号区域 (遇到空白边缘)")
                     return None
-                elif 0.10 <= black_ratio <= 0.90:
+                elif 0.01 <= black_ratio <= 0.99:
                     # 找到可能的编号区域右边界
                     consecutive_label_cols += 1
-                    if consecutive_label_cols >= 3:  # 连续3列都在标签范围内才确认
+                    if consecutive_label_cols >= 2:  # 连续2列都在标签范围内才确认
                         label_right = current_x + 2  # 取最早的一列
                         state = 1
                         print(f"  发现编号区域右边界: {label_right}, 连续{consecutive_label_cols}列")
@@ -100,18 +100,34 @@ class TireOCR:
                     consecutive_label_cols = 0  # 重置计数
                     
             elif state == 1:
-                if black_ratio > 0.98:
+                if black_ratio > 0.995:
                     consecutive_tread_cols += 1
                     
-                    # 增加容忍度机制：连续5个像素列整体>98%才确认为左边界
-                    if consecutive_tread_cols >= 5:
-                        # 检查这5列的平均黑色像素比例
+                    # 增加容忍度机制：连续10个像素列都>99.5%才确认为左边界
+                    if consecutive_tread_cols >= 15:
+                        # 检查这10列是否都满足黑色像素比例 > 99.5%
                         check_start = current_x
-                        check_end = current_x + 4  # 包括当前列和前4列
-                        total_black_ratio = 0
+                        check_end = current_x + 14  # 包括当前列和前9列
+                        all_valid = True
                         check_count = 0
                         
+                        # 独立判断每一列
+                        for check_x in range(check_start, check_end + 1):
+                            if check_x >= 0:
+                                check_black_pixels = np.sum(self.binary_image[:, check_x] == 0)
+                                check_black_ratio = check_black_pixels / height
+                                if check_black_ratio <= 0.995:  # 如果任何一列不满足条件
+                                    all_valid = False
+                                    break
+                                check_count += 1
+                        
+                        if all_valid and check_count == 15:  # 所有10列都满足条件
+                            label_left = current_x + 2  # 取最早的一列
+                            print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，所有列黑色像素比例均>99.5%")
+                            break
+                        
                         # 检查范围是否有效
+                        total_black_ratio = 0
                         for check_x in range(check_start, check_end + 1):
                             if check_x >= 0:
                                 check_black_pixels = np.sum(self.binary_image[:, check_x] == 0)
@@ -121,7 +137,7 @@ class TireOCR:
                         
                         if check_count > 0:
                             avg_black_ratio = total_black_ratio / check_count
-                            if avg_black_ratio > 0.98:
+                            if avg_black_ratio > 0.995:  # 平均黑色像素比例必须非常高，说明确实是胎面区域
                                 label_left = current_x + 2  # 取最早的一列
                                 print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，平均黑色像素比例={avg_black_ratio:.3f}")
                                 break
@@ -143,10 +159,10 @@ class TireOCR:
                 black_ratio = black_pixels / height
                 
                 if state == 0:
-                    if black_ratio < 0.05:
+                    if black_ratio < 0.01:
                         print("  宽松模式: 遇到空白边缘")
                         return None
-                    elif 0.05 <= black_ratio <= 0.95:  # 放宽阈值
+                    elif 0.01 <= black_ratio <= 0.99:  # 放宽阈值
                         if label_right is None:
                             label_right = current_x
                             state = 1
@@ -173,8 +189,8 @@ class TireOCR:
         
         # 计算基于编号区域向内扩展的宽度
         # 编号区域宽度通常较小，我们向两边扩展固定宽度
-        expand_left = 50  # 向左扩展50像素
-        expand_right = 50  # 向右扩展50像素
+        expand_left = 0  # 向左扩展0像素（修改后的参数）
+        expand_right = 40  # 向右扩展40像素
         
         # 计算胎面区域边界
         left_bound = max(0, label_left - expand_left)
@@ -186,13 +202,13 @@ class TireOCR:
         if right_bound < label_right:
             right_bound = min(width - 1, label_right + 10)  # 如果右边扩展不够，至少保证包含编号区域
         
-        # 按照经验，ROI的左边界再向左扩展整体宽度的20%（用户反馈需要更多扩展）
+        # 按照经验，ROI的左边界再向左扩展整体宽度的0%（修改后的参数）
         region_width = right_bound - left_bound
-        left_extension = int(region_width * 0.20)  # 整体宽度的20%
+        left_extension = int(region_width * 0)  # 整体宽度的0%（修改后的参数）
         left_bound = max(0, left_bound - left_extension)
         
         print(f"  原始胎面区域: {left_bound+left_extension}-{right_bound}, 宽度={region_width}")
-        print(f"  左边界扩展: {left_extension}像素 (整体宽度的20%)")
+        print(f"  左边界扩展: {left_extension}像素 (整体宽度的0%)")
         
         # 确保宽度合理
         min_width = 80  # 胎面区域最小宽度
@@ -244,10 +260,10 @@ class TireOCR:
         # 我们需要找到从背景（黑色像素低）到胎面（黑色像素高）的过渡
         # 但实际上，图像已经裁剪到胎面区域，所以我们需要找胎面的真正上下边缘
         
-        # 方法：寻找连续多行黑色像素比例 < 90% 的区域，认为是胎面边缘
+        # 方法：寻找连续多行黑色像素比例 < 99% 的区域，认为是胎面边缘
         top_bound = 0
         consecutive_low_black_rows = 0
-        threshold_low_black = 0.90  # 黑色像素比例低于90%认为是边缘
+        threshold_low_black = 0.99  # 黑色像素比例低于99%认为是边缘
         
         for y in range(tread_height):
             black_pixels = np.sum(tread_binary[y, :] == 0)
@@ -306,13 +322,15 @@ class TireOCR:
         # 使用新的上下边界裁剪胎面区域
         self.tread_roi_image = self.tread_roi_image[top_bound:bottom_bound+1, :]
         
-        # 4. 图像增强
+        # 4. 图像增强（改为全局二值化+旋转）
         # 灰度化
         roi_gray = cv2.cvtColor(self.tread_roi_image, cv2.COLOR_BGR2GRAY)
         
-        # CLAHE 增强
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        self.enhanced_image = clahe.apply(roi_gray)
+        # 全局二值化（Otsu）替代CLAHE
+        _, self.enhanced_image = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 顺时针旋转90度（原始尺寸229x2396 -> 旋转后2396x229）
+        self.enhanced_image = cv2.rotate(self.enhanced_image, cv2.ROTATE_90_CLOCKWISE)
         
         # 保存中间结果
         cv2.imwrite(os.path.join(self.output_dir, "1_binary.png"), self.binary_image)
@@ -352,7 +370,7 @@ class TireOCR:
         # Enhanced image
         if self.enhanced_image is not None:
             axes[1, 1].imshow(self.enhanced_image, cmap='gray')
-            axes[1, 1].set_title("CLAHE Enhancement")
+            axes[1, 1].set_title("Binary + Rotated (2396x229)")
             axes[1, 1].axis('off')
         
         plt.tight_layout()
@@ -450,12 +468,12 @@ class TireOCR:
             end = e
         
         # 扩展区域以确保包含整个编号区域
-        margin = 15  # 扩展边界
+        margin = 30  # 扩展边界，避免截断
         x_start = max(0, start - margin)
         x_end = min(width - 1, end + margin)
         
-        # 确保宽度至少为20像素
-        min_width = 20
+        # 确保宽度至少为100像素，避免过窄导致旋转后高度太小
+        min_width = 100
         if x_end - x_start < min_width:
             # 扩展宽度
             center = (x_start + x_end) // 2
@@ -466,54 +484,52 @@ class TireOCR:
         y_start = 0
         y_end = height - 1
         
-        # 提取标签 ROI
-        self.label_roi_image = self.tread_roi_image[y_start:y_end+1, x_start:x_end+1]
+        # 调试输出
+        print(f"    编号区域原始范围: {start}-{end}, 宽度={end-start}")
+        print(f"    扩展后范围: {x_start}-{x_end}, 宽度={x_end-x_start}")
+        print(f"    ROI高度范围: {y_start}-{y_end}, 高度={y_end-y_start+1}")
         
-        # 检查提取的ROI是否有效
-        if self.label_roi_image is None or self.label_roi_image.size == 0:
-            print(f"  错误: 提取的编号区域ROI为空")
-            self.label_roi_image = None
-            self.label_binary = None
-            return None
-            
-        print(f"  提取编号区域ROI: 位置({x_start},{y_start})-({x_end},{y_end}), 尺寸={self.label_roi_image.shape}")
+        # 直接使用已经旋转过的增强图像（3_enhanced.png），不再进行旋转
+        # 第一阶段已经顺时针旋转90度，尺寸为2396x229
+        print(f"  使用已旋转的增强图像: 尺寸={self.enhanced_image.shape}")
         
-        # 重要：原图是逆时针旋转90度的垂直方向，需要顺时针旋转90度变成正常水平方向
-        # 这样从左到右就是字符序列的总长，上下就是字符高度
-        label_roi_rotated = cv2.rotate(self.label_roi_image, cv2.ROTATE_90_CLOCKWISE)
-        
-        # 在旋转后的编号区域内提取二值化字符
-        label_gray = cv2.cvtColor(label_roi_rotated, cv2.COLOR_BGR2GRAY)
-        
-        # 增强对比度
-        label_enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(label_gray)
-        
-        # 使用自适应阈值提取字符（在编号区域内）
-        label_binary = cv2.adaptiveThreshold(label_enhanced, 255,
-                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                             cv2.THRESH_BINARY, 21, 5)
+        # 由于第一阶段已经进行了全局二值化，self.enhanced_image已经是二值图像
+        # 直接使用它作为基础，但确保字符是白色（255），背景是黑色（0）
+        label_binary = self.enhanced_image.copy()
         
         # 确保字符是白色（255），背景是黑色（0）
         # 对于编号区域，背景应该是黑色（胎面），字符是白色
-        white_pixels = np.sum(label_binary == 255)
-        black_pixels = np.sum(label_binary == 0)
-        if white_pixels < black_pixels:  # 如果字符是黑色，背景是白色
+        # 检查编号区域内部的像素分布，而不是整个图像
+        label_region = label_binary[:, x_start:x_end+1]
+        white_pixels_in_label = np.sum(label_region == 255)
+        black_pixels_in_label = np.sum(label_region == 0)
+        
+        # 如果编号区域内部白色像素比例 > 30%，说明字符是白色，背景是黑色
+        # 否则，需要反转图像
+        white_ratio_in_label = white_pixels_in_label / label_region.size if label_region.size > 0 else 0
+        print(f"    编号区域内部白色像素比例: {white_ratio_in_label:.3f}")
+        
+        if white_ratio_in_label < 0.3:  # 如果编号区域内部白色像素太少
+            print("    反转图像使字符变白")
             label_binary = cv2.bitwise_not(label_binary)
         
-        # 形态学闭运算，连接离散的点阵字符
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # 先进行开运算去除小噪声，分离字符
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        # 可选：开运算去除小噪声
-        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        # 再进行闭运算连接字符内部的离散点，但避免过度连接不同字符
+        # 由于图像现在是水平方向（宽2396，高229），使用水平方向连接
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))  # 水平方向连接，垂直方向不连接
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
         
         self.label_binary = label_binary
         
-        # 保存旋转后的中间结果（用于后续分割）
-        cv2.imwrite(os.path.join(self.output_dir, "4_label_binary.png"), self.label_binary)
-        
-        # 也保存旋转后的彩色ROI用于可视化
-        cv2.imwrite(os.path.join(self.output_dir, "4_label_roi_rotated.png"), label_roi_rotated)
+        # 更新相关变量以保持兼容性
+        if len(self.enhanced_image.shape) == 2:
+            enhanced_bgr = cv2.cvtColor(self.enhanced_image, cv2.COLOR_GRAY2BGR)
+        else:
+            enhanced_bgr = self.enhanced_image
+        self.label_roi_image = enhanced_bgr  # 保存原始增强图像作为ROI
         
         return self.label_binary
     
@@ -555,9 +571,7 @@ class TireOCR:
     def stage3_character_segmentation(self) -> List[np.ndarray]:
         """
         第三阶段：字符区域分割
-        1. 使用连通域分析找到独立的字符区域
-        2. 针对点阵字符特征调整过滤条件
-        3. 归一化处理 (64x64)，但不进行字符识别
+        使用垂直投影法分割字符，适用于点阵字符
         
         Returns:
             归一化后的字符图像列表，若无标签则返回空列表
@@ -568,113 +582,98 @@ class TireOCR:
             self.char_positions = []
             return []
         
-        print("  开始标签内字符区域分割...")
+        print("  开始标签内字符区域分割（垂直投影法）...")
         binary = self.label_binary.copy()
         height, width = binary.shape
         
-        # 1. 使用连通域分析找到独立的字符区域
-        # 先进行一些形态学操作，确保字符内部连接良好
-        kernel = np.ones((3, 3), np.uint8)
-        binary_processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # 计算垂直投影（每列白色像素数量）
+        vertical_projection = np.sum(binary > 0, axis=0)
         
-        # 寻找连通域
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_processed, connectivity=8)
+        # 平滑投影曲线，去除噪声
+        kernel_size = 5
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed_projection = np.convolve(vertical_projection, kernel, mode='same')
         
-        print(f"  找到 {num_labels-1} 个连通域 (排除背景)")
+        # 计算阈值：使用平均值的1.5倍作为字符阈值
+        mean_projection = np.mean(smoothed_projection)
+        char_threshold = mean_projection * 1.5
+        
+        # 标记字符列
+        char_cols = smoothed_projection > char_threshold
+        
+        # 找到字符区域（连续的字符列）
+        regions = []
+        in_char = False
+        start = 0
+        
+        for i in range(len(char_cols)):
+            if char_cols[i] and not in_char:
+                in_char = True
+                start = i
+            elif not char_cols[i] and in_char:
+                in_char = False
+                end = i - 1
+                width_px = end - start + 1
+                # 只保留宽度在合理范围内的区域
+                if 5 <= width_px <= 30:
+                    regions.append((start, end, width_px))
+        
+        # 处理最后一个区域
+        if in_char:
+            end = len(char_cols) - 1
+            width_px = end - start + 1
+            if 5 <= width_px <= 30:
+                regions.append((start, end, width_px))
+        
+        print(f"  找到 {len(regions)} 个候选字符区域")
         
         self.segmented_chars = []
         self.char_positions = []
         
-        # 遍历所有连通域（跳过背景，索引0）
-        for label in range(1, num_labels):
-            # 获取连通域的统计信息
-            x = stats[label, cv2.CC_STAT_LEFT]
-            y = stats[label, cv2.CC_STAT_TOP]
-            w = stats[label, cv2.CC_STAT_WIDTH]
-            h = stats[label, cv2.CC_STAT_HEIGHT]
-            area = stats[label, cv2.CC_STAT_AREA]
+        for idx, (start_col, end_col, region_width) in enumerate(regions):
+            # 提取字符区域
+            # 水平方向：取整个高度（字符通常垂直占满）
+            char_img = binary[:, start_col:end_col+1]
             
-            # 检查连通域是否有效
-            if area < 50:  # 最小面积50像素
-                print(f"    跳过连通域 {label}: 面积过小 {area}")
-                continue
+            # 裁剪上下空白
+            horizontal_proj = np.sum(char_img > 0, axis=1)
+            # 找到有字符的行
+            char_rows = horizontal_proj > 0
+            if np.any(char_rows):
+                top = np.where(char_rows)[0][0]
+                bottom = np.where(char_rows)[0][-1]
+                # 稍微扩展一点
+                top = max(0, top - 2)
+                bottom = min(height - 1, bottom + 2)
+                char_img = char_img[top:bottom+1, :]
             
-            # 计算宽高比
-            if h == 0:
-                continue
-            aspect_ratio = w / h
+            # 裁剪左右空白
+            vertical_proj = np.sum(char_img > 0, axis=0)
+            char_cols_img = vertical_proj > 0
+            if np.any(char_cols_img):
+                left = np.where(char_cols_img)[0][0]
+                right = np.where(char_cols_img)[0][-1]
+                # 稍微扩展一点
+                left = max(0, left - 1)
+                right = min(char_img.shape[1] - 1, right + 1)
+                char_img = char_img[:, left:right+1]
             
-            # 正立字符的宽高比通常在0.3到3.0之间
-            min_aspect_ratio = 0.3   # 最小宽高比（较窄字符）
-            max_aspect_ratio = 3.0   # 最大宽高比（较宽字符）
-            
-            if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
-                print(f"    跳过连通域 {label}: 宽高比异常 {aspect_ratio:.3f}")
-                continue
-            
-            # 提取字符图像
-            char_img = binary[y:y+h, x:x+w]
-            
-            # 确保图像有效
             if char_img.size == 0:
-                print(f"    跳过连通域 {label}: 字符图像为空")
                 continue
             
-            # 裁剪上下左右的空白
-            # 水平投影，裁剪上下空白
-            horizontal_projection = np.sum(char_img > 0, axis=1)
-            h_blank_threshold = max(1, w * 0.05)
-            top = 0
-            bottom = h - 1
+            # 归一化处理
+            normalized_char = self._normalize_char(char_img)
             
-            for i in range(h):
-                if horizontal_projection[i] > h_blank_threshold:
-                    top = max(0, i - 1)
-                    break
-            
-            for i in range(h - 1, -1, -1):
-                if horizontal_projection[i] > h_blank_threshold:
-                    bottom = min(h - 1, i + 1)
-                    break
-            
-            # 垂直投影，裁剪左右空白
-            vertical_projection = np.sum(char_img > 0, axis=0)
-            v_blank_threshold = max(1, (bottom - top + 1) * 0.05)
-            left_crop = 0
-            right_crop = w - 1
-            
-            for i in range(w):
-                if vertical_projection[i] > v_blank_threshold:
-                    left_crop = max(0, i - 1)
-                    break
-            
-            for i in range(w - 1, -1, -1):
-                if vertical_projection[i] > v_blank_threshold:
-                    right_crop = min(w - 1, i + 1)
-                    break
-            
-            # 重新计算裁剪后的尺寸
-            crop_height = bottom - top + 1
-            crop_width = right_crop - left_crop + 1
-            
-            if crop_height < 3 or crop_width < 3:
-                print(f"    跳过连通域 {label}: 裁剪后尺寸过小 ({crop_width}x{crop_height})")
-                continue
-            
-            # 提取裁剪后的字符
-            cropped_char = char_img[top:bottom+1, left_crop:right_crop+1]
-            
-            # 更新位置信息（相对于原始label_binary）
-            final_left = x + left_crop
-            final_top = y + top
-            final_right = x + left_crop + crop_width
-            final_bottom = y + top + crop_height
-            
-            # 归一化处理 (64x64)
-            normalized_char = self._normalize_char(cropped_char)
+            # 保存位置信息（相对于原始label_binary）
+            final_left = start_col
+            final_top = 0
+            final_right = end_col + 1
+            final_bottom = height - 1
             
             self.segmented_chars.append(normalized_char)
             self.char_positions.append((final_left, final_top, final_right, final_bottom))
+            
+            print(f"    字符区域 {idx}: 列 {start_col}-{end_col}, 宽度={region_width}, 裁剪后尺寸={char_img.shape}")
         
         print(f"  分割出 {len(self.segmented_chars)} 个有效字符区域")
         
@@ -961,46 +960,22 @@ class TireOCR:
     # ==================== 完整处理流程 ====================
     def full_pipeline(self, image_path: str) -> str:
         """
-        完整处理流程（重构版）
+        简化处理流程：只运行第一阶段
         Args:
             image_path: 输入图像路径
             
         Returns:
-            识别出的字符串
+            处理状态字符串
         """
-        print("=== 开始处理图像 ===")
+        print("=== 开始处理图像（简化版） ===")
         # 第一阶段：胎面 ROI 提取
         enhanced = self.stage1_extract_roi(image_path)
         if enhanced is None:
-            print("第一阶段完成: 未发现编号区域，直接判定为'无'")
-            return "无"
+            print("处理完成: 未发现编号区域")
+            return "无编号区域"
         
-        print("第一阶段完成: 胎面 ROI 提取与增强")
-        
-        # 第二阶段：标签区域定位
-        label_binary = self.stage2_label_localization()
-        if label_binary is not None:
-            print("第二阶段完成: 找到标签区域")
-        else:
-            print("第二阶段完成: 未发现标签区域")
-            return "无标签"
-        
-        # 第三阶段：字符区域分割
-        char_images = self.stage3_character_segmentation()
-        if char_images:
-            print(f"第三阶段完成: 分割出 {len(char_images)} 个字符区域")
-        else:
-            print("第三阶段完成: 无字符区域可分割")
-            return "无字符"
-        
-        # 第四阶段：HOG+SVM 识别
-        result = self.stage4_hog_svm_recognition(char_images)
-        print(f"第四阶段完成: 识别结果 = '{result}'")
-        
-        # 保存最终结果图像
-        self._save_final_result(result)
-        
-        return result
+        print(f"处理完成: 生成增强图像 {self.enhanced_image.shape}，已保存为 3_enhanced.png")
+        return "成功生成增强图像"
     
     def _save_final_result(self, result: str):
         """保存最终识别结果图像"""
@@ -1026,24 +1001,19 @@ class TireOCR:
     
     def run_and_visualize(self, image_path: str):
         """
-        运行完整流程并可视化所有结果
+        运行简化流程并可视化第一阶段结果
         """
         result = self.full_pipeline(image_path)
         
-        # 可视化各阶段结果
+        # 只可视化第一阶段结果
         if hasattr(self, 'original_image') and self.original_image is not None:
             self.stage1_visualize()
         
-        if hasattr(self, 'label_binary') and self.label_binary is not None:
-            self.stage2_visualize()
-        
-        if self.segmented_chars:
-            self.stage3_visualize()
-        
         print(f"\n=== 处理完成 ===")
         print(f"原始图像: {image_path}")
-        print(f"识别结果: {result}")
+        print(f"处理结果: {result}")
         print(f"中间结果保存在: {self.output_dir}/")
+        print(f"关键输出: 3_enhanced.png (尺寸: {self.enhanced_image.shape if hasattr(self, 'enhanced_image') and self.enhanced_image is not None else 'N/A'})")
         
         return result
 
