@@ -11,21 +11,25 @@ CFG = {
     "FIGSIZE_PER_COL": 6,
     "FIG_HEIGHT": 6,
     # 子图行高度比例（上行原图，下行投影）
-    "HEIGHT_RATIOS": [3, 1],
+    "HEIGHT_RATIOS": [2, 1],
     # 保存时的输出 DPI
     "PLOT_DPI": 100,
     # 二值掩码阈值因子：阈值 = BINARY_THRESH_FACTOR * max(projection)
     "BINARY_THRESH_FACTOR": 0.01,
     # 合并相近区间的距离（像素列），若两个区间间距小于该值则合并
-    "MERGE_DISTANCE": 35,
+    "MERGE_DISTANCE": 5,
     # 过滤噪声的最小宽度（像素列），小于该宽度的连通区间会被丢弃
-    "MIN_WIDTH": 20,
+    "MIN_WIDTH": 10,
     # 高斯平滑核大小（奇数），建议 5,7,11
     "GAUSSIAN_KERNEL": 5,
     # 高斯平滑的标准差
     "GAUSSIAN_SIGMA": 1.0,
     # 高斯平滑后小值直接置零的绝对阈值（投影值范围0..1），若设置为 None 则使用 BINARY_THRESH_FACTOR * max
     "SMOOTH_ZERO_THRESHOLD": 0.09,
+    # 非线性增强参数：gamma<1 可抬升低幅波峰、压缩高峰动态范围
+    "NONLINEAR_GAMMA": 0.15,
+    # 局部对比度窗口（像素列，建议奇数）
+    "LOCAL_CONTRAST_WINDOW": 41,
 }
 
 # --------------------------------------------------------------
@@ -63,7 +67,8 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
     算法要点：
     - 对投影做 1D 高斯平滑以去噪。
     - 使用全局低阈值（binary_thresh_factor * max）把较小值设为 0（区分背景）。
-    - 计算一阶导数，在导数从正变负的位置判定局部峰值（zero-crossing of derivative）。
+    - 先做非线性重缩放（gamma）压缩大峰、抬升小峰，再做局部对比度增强。
+    - 在增强信号上计算一阶导数，在导数从正变负的位置判定局部峰值（zero-crossing of derivative）。
     - 仅保留阈值化后非零区域内的峰；并按 min_width 过滤过窄区域噪声。
 
     参数（都可从 CFG 读取默认值）：
@@ -104,16 +109,39 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
     gauss = gauss / np.sum(gauss)
     proj_smooth = np.convolve(projection.astype(float), gauss, mode='same')
 
+    # 非线性重缩放 + 局部对比度增强
+    eps = 1e-8
+    smooth_max = float(np.max(proj_smooth))
+    if smooth_max <= 0:
+        return []
+    gamma = float(CFG.get("NONLINEAR_GAMMA", 0.65))
+    gamma = max(0.1, min(1.5, gamma))
+    # gamma < 1: 压缩高峰并抬升低峰，缓解动态范围过大
+    nonlinear = np.power(np.clip(proj_smooth / smooth_max, 0.0, 1.0), gamma)
+
+    w = int(CFG.get("LOCAL_CONTRAST_WINDOW", 81))
+    if w < 3:
+        w = 3
+    if w % 2 == 0:
+        w += 1
+    kernel = np.ones(w, dtype=float) / float(w)
+    local_mean = np.convolve(nonlinear, kernel, mode='same')
+    local_dev = np.convolve(np.abs(nonlinear - local_mean), kernel, mode='same')
+    enhanced = np.maximum(0.0, (nonlinear - local_mean) / (local_dev + eps))
+    enh_max = float(np.max(enhanced))
+    if enh_max > 0:
+        enhanced = enhanced / enh_max
+
     # 阈值化：优先使用绝对阈值 SMOOTH_ZERO_THRESHOLD（如果设置），否则使用相对阈值 thresh
-    proc = proj_smooth.copy()
+    proc = enhanced.copy()
     smooth_zero_thresh = CFG.get("SMOOTH_ZERO_THRESHOLD", None)
     if smooth_zero_thresh is not None:
         proc[proc < float(smooth_zero_thresh)] = 0.0
     else:
-        proc[proc < thresh] = 0.0
+        proc[proc < float(binary_thresh_factor)] = 0.0
 
     # 导数符号切换法：导数从正到负的位置作为候选峰值
-    smoothed = proj_smooth
+    smoothed = enhanced
     d = np.diff(smoothed)
     peaks = []
     n = len(smoothed)
@@ -139,7 +167,7 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
         lo = max(start + 1, 1)
         hi = min(end - 1, n - 2)
         for j in range(lo, hi + 1):
-            if d[j - 1] > 0.0 and d[j] < 0.0:
+            if d[j - 1] > 0.0 and d[j] < 0.0 and smoothed[j] > 0.0:
                 local_peaks.append(j)
 
         if local_peaks:
@@ -155,7 +183,7 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
     # 兜底：若分段结果为空，则直接在全局平滑曲线上找导数由正到负且高于阈值的点
     if not peaks:
         for j in range(1, n - 1):
-            if d[j - 1] > 0.0 and d[j] < 0.0 and smoothed[j] >= thresh:
+            if d[j - 1] > 0.0 and d[j] < 0.0 and smoothed[j] >= float(binary_thresh_factor):
                 peaks.append((float(j), float(projection[j])))
 
     return peaks

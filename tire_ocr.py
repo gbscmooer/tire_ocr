@@ -36,14 +36,14 @@ class TireOCR:
             'stage2_close_iterations': 2,
             
             # Stage5 形态学参数 (字符连通) - 降权避免横向粘连
-            'stage5_open_kernel': (2, 2),        # 轻量开运算去噪
+            'stage5_open_kernel': (5, 1),        # 轻量开运算去噪
             'stage5_open_iterations': 1,
             'stage5_dilation_kernel': (1, 7),    # 窄宽度，重点垂直连接（原(9,3)太宽）
             'stage5_dilation_iterations': 1,
-            'stage5_close_kernel': (2, 15),       # 调整为垂直方向连接
-            'stage5_close_iterations': 2,
-            'stage5_h_erosion_kernel': (5, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
-            'stage5_h_erosion_iterations':3,    # 横向腐蚀迭代次数
+            'stage5_close_kernel': (1, 15),       # 调整为垂直方向连接
+            'stage5_close_iterations': 1,
+            'stage5_h_erosion_kernel': (3, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
+            'stage5_h_erosion_iterations':2,    # 横向腐蚀迭代次数
             
             # 轮廓过滤参数
             'contour_min_w': 8,
