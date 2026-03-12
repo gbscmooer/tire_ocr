@@ -3,7 +3,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
-import random
+import subprocess
 
 class TireOCR:
     """橡胶胎面点阵字符识别主类"""
@@ -16,6 +16,62 @@ class TireOCR:
         """
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # ==================== 集中配置参数 ====================
+        self.cfg = {
+            # ROI 边界扩展 (stage1)
+            'expand_left': 0,           # 向左扩展像素
+            'expand_right': 40,         # 向右扩展像素
+            'min_width': 80,           # 胎面区域最小宽度
+            'max_width': 350,          # 胎面区域最大宽度
+            'expand_top': 20,          # 上边界扩展像素
+            'expand_bottom': 20,       # 下边界扩展像素
+            
+            # Stage2 形态学参数
+            'stage2_open_kernel': (2, 2),
+            'stage2_open_iterations': 1,
+            'stage2_dilation_kernel': (7, 9),
+            'stage2_dilation_iterations': 1,
+            'stage2_close_kernel': (9, 7),
+            'stage2_close_iterations': 2,
+            
+            # Stage5 形态学参数 (字符连通) - 降权避免横向粘连
+            'stage5_open_kernel': (2, 2),        # 轻量开运算去噪
+            'stage5_open_iterations': 1,
+            'stage5_dilation_kernel': (1, 7),    # 窄宽度，重点垂直连接（原(9,3)太宽）
+            'stage5_dilation_iterations': 1,
+            'stage5_close_kernel': (2, 15),       # 调整为垂直方向连接
+            'stage5_close_iterations': 2,
+            'stage5_h_erosion_kernel': (5, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
+            'stage5_h_erosion_iterations':3,    # 横向腐蚀迭代次数
+            
+            # 轮廓过滤参数
+            'contour_min_w': 8,
+            'contour_min_h': 12,
+            'contour_max_w': 90,
+            'contour_max_h': 60,
+            'contour_min_area': 80,
+            'contour_min_fill_ratio': 0.15,
+            'contour_aspect_min': 0.15,
+            'contour_aspect_max': 5.0,
+            'contour_merge_gap': 10,           # 轮廓合并的最大间隙
+            'contour_y_std_factor': 1.0,       # Y轴过滤的标准差倍数
+            
+            # 字符分割参数
+            'split_width_threshold': 35,       # 触发分割的字符宽度阈值
+            'split_valley_ratio': 0.5,         # 水平投影波谷阈值比例
+            'split_edge_margin': 10,           # 分割点距边缘的最小距离
+            'split_min_char_width': 20,         # 分割后字符的最小宽度
+            
+            # 识别参数
+            'confidence_threshold': 0.01,      # 置信度阈值
+            'knn_k': 3,                        # KNN 的 k 值
+            
+            # 其他阈值
+            'white_pixel_ratio_invert': 0.5,   # 白色像素比例超过此值则反转图像
+            'white_pixel_ratio_low': 0.1,      # 白色像素比例低于此值则检查反转
+            'white_pixel_ratio_label': 0.05,   # 编号区域白色像素比例阈值
+        }
         
         # 存储中间结果
         self.original_image = None          # 原始图像
@@ -37,11 +93,8 @@ class TireOCR:
         self.label_left_relative = None     # 编号区域在胎面ROI中的相对左偏移
         self.label_right_relative = None    # 编号区域在胎面ROI中的相对右偏移
 
-        # 字符识别相关
-        self.classifier = None              # 训练好的分类器 (SVM)
-        self.hog_descriptor = None          # HOG 特征描述器
-        self.class_labels = []              # 类别标签
-        self.is_trained = False
+        # 形态学处理结果
+        self.morph_image = None             # 形态学处理后的图像
     
     # ==================== 第一阶段：ROI 提取与预处理 ====================
     def stage1_extract_roi(self, image_path: str) -> np.ndarray:
@@ -189,8 +242,8 @@ class TireOCR:
         
         # 计算基于编号区域向内扩展的宽度
         # 编号区域宽度通常较小，我们向两边扩展固定宽度
-        expand_left = 0  # 向左扩展0像素（修改后的参数）
-        expand_right = 40  # 向右扩展40像素
+        expand_left = self.cfg['expand_left']  # 向左扩展像素
+        expand_right = self.cfg['expand_right']  # 向右扩展像素
         
         # 计算胎面区域边界
         left_bound = max(0, label_left - expand_left)
@@ -498,29 +551,43 @@ class TireOCR:
         label_binary = self.enhanced_image.copy()
         
         # 确保字符是白色（255），背景是黑色（0）
-        # 对于编号区域，背景应该是黑色（胎面），字符是白色
-        # 检查编号区域内部的像素分布，而不是整个图像
-        label_region = label_binary[:, x_start:x_end+1]
-        white_pixels_in_label = np.sum(label_region == 255)
-        black_pixels_in_label = np.sum(label_region == 0)
+        # 对于点阵字符，白色像素比例通常很低（因为是点状）
+        # 检查整个图像的白色像素比例来决定是否反转
+        white_pixels_total = np.sum(label_binary == 255)
+        total_pixels = label_binary.size
+        white_ratio_total = white_pixels_total / total_pixels if total_pixels > 0 else 0
+        print(f"    整体图像白色像素比例: {white_ratio_total:.3f}")
         
-        # 如果编号区域内部白色像素比例 > 30%，说明字符是白色，背景是黑色
-        # 否则，需要反转图像
-        white_ratio_in_label = white_pixels_in_label / label_region.size if label_region.size > 0 else 0
-        print(f"    编号区域内部白色像素比例: {white_ratio_in_label:.3f}")
-        
-        if white_ratio_in_label < 0.3:  # 如果编号区域内部白色像素太少
-            print("    反转图像使字符变白")
+        # 点阵字符：如果白色像素比例 > 50%，说明背景是白色，需要反转
+        # 如果白色像素比例 < 30%，说明字符是白色在黑色背景上，这正是我们想要的
+        if white_ratio_total > 0.5:  # 背景是白色，需要反转
+            print("    背景为白色，反转图像使字符变白，背景变黑")
             label_binary = cv2.bitwise_not(label_binary)
+        elif white_ratio_total < 0.1:  # 白色像素太少，可能是反转了两次或其他问题
+            print("    白色像素太少，检查是否需要反转...")
+            # 检查编号区域
+            label_region = label_binary[:, x_start:x_end+1]
+            white_ratio_in_label = np.sum(label_region == 255) / label_region.size if label_region.size > 0 else 0
+            print(f"    编号区域内部白色像素比例: {white_ratio_in_label:.3f}")
+            if white_ratio_in_label < 0.05:  # 编号区域也几乎没有白色像素
+                print("    编号区域也缺少白色像素，反转图像")
+                label_binary = cv2.bitwise_not(label_binary)
         
         # 先进行开运算去除小噪声，分离字符
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, self.cfg['stage2_open_kernel'])
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_OPEN, kernel_open, 
+                                       iterations=self.cfg['stage2_open_iterations'])
         
-        # 再进行闭运算连接字符内部的离散点，但避免过度连接不同字符
-        # 由于图像现在是水平方向（宽2396，高229），使用水平方向连接
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))  # 水平方向连接，垂直方向不连接
-        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        # 增强形态学：先膨胀再闭运算，强制连接点阵字符成块
+        # 使用较大的核连接垂直和水平方向上的离散点
+        kernel_dilation = cv2.getStructuringElement(cv2.MORPH_RECT, self.cfg['stage2_dilation_kernel'])
+        label_binary = cv2.dilate(label_binary, kernel_dilation, 
+                                 iterations=self.cfg['stage2_dilation_iterations'])
+        
+        # 再进行闭运算填充内部空隙，形成完整字符块
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, self.cfg['stage2_close_kernel'])
+        label_binary = cv2.morphologyEx(label_binary, cv2.MORPH_CLOSE, kernel_close, 
+                                       iterations=self.cfg['stage2_close_iterations'])
         
         self.label_binary = label_binary
         
@@ -798,164 +865,78 @@ class TireOCR:
         plt.tight_layout()
         plt.savefig(os.path.join(self.output_dir, "stage3_result.png"), dpi=150)
         plt.show()
+
+    def _get_kernel_size(self, key: str) -> Tuple[int, int]:
+        """读取并规范化形态学核尺寸，确保传给 OpenCV 的 ksize 为正整数元组。"""
+        raw = self.cfg.get(key)
+        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+            raise ValueError(f"配置项 {key} 必须是长度为2的 tuple/list，当前值: {raw}")
+
+        try:
+            kx = max(1, int(round(raw[0])))
+            ky = max(1, int(round(raw[1])))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"配置项 {key} 含有非法核尺寸值: {raw}") from exc
+
+        return (kx, ky)
     
-    # ==================== 第四阶段：传统字符识别 (HOG+SVM) ====================
-    def _generate_synthetic_dataset(self, num_samples_per_char: int = 30) -> Tuple[np.ndarray, np.ndarray]:
+    # ==================== 第四阶段：形态学处理输出 ====================
+    def stage4_morphology_prepare(self, image: np.ndarray = None) -> Optional[np.ndarray]:
         """
-        生成合成点阵字符数据集
+        第四阶段：形态学处理输出
+        执行开运算、膨胀、闭运算等形态学操作，连接点阵字符成块，
+        并保存结果为 output/morphology_result.png
+        
         Args:
-            num_samples_per_char: 每个字符生成的样本数量
-        
-        Returns:
-            images: 归一化后的字符图像列表
-            labels: 对应的标签（0-9, A-Z 映射为 0-35）
-        """
-        chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        char_to_label = {char: idx for idx, char in enumerate(chars)}
-        
-        images = []
-        labels = []
-        
-        # 创建空白图像用于绘制
-        canvas_size = 64
-        font_choices = [
-            cv2.FONT_HERSHEY_SIMPLEX,
-            cv2.FONT_HERSHEY_PLAIN,
-            cv2.FONT_HERSHEY_DUPLEX,
-            cv2.FONT_HERSHEY_COMPLEX,
-            cv2.FONT_HERSHEY_TRIPLEX
-        ]
-        
-        print(f"  生成合成字符数据集 ({len(chars)} 个字符，每个 {num_samples_per_char} 个样本)...")
-        
-        for char in chars:
-            for sample_idx in range(num_samples_per_char):
-                # 随机选择字体和大小
-                font = random.choice(font_choices)
-                font_scale = random.uniform(1.5, 3.0)
-                thickness = random.randint(1, 3)
-                
-                # 创建空白图像（黑色背景）
-                img = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
-                
-                # 计算文本大小和位置
-                (text_width, text_height), baseline = cv2.getTextSize(char, font, font_scale, thickness)
-                x = (canvas_size - text_width) // 2
-                y = (canvas_size + text_height) // 2
-                
-                # 绘制白色字符
-                cv2.putText(img, char, (x, y), font, font_scale, 255, thickness)
-                
-                # 添加噪声以模拟真实点阵字符
-                # 1. 随机点阵化：将部分像素设为0（模拟点阵缺失）
-                mask = np.random.random((canvas_size, canvas_size)) > 0.85  # 15% 的像素被移除
-                img[mask] = 0
-                
-                # 2. 添加高斯噪声
-                noise = np.random.normal(0, 10, (canvas_size, canvas_size)).astype(np.int32)
-                img = np.clip(img.astype(np.int32) + noise, 0, 255).astype(np.uint8)
-                
-                # 3. 形态学操作模拟点阵
-                kernel_size = random.choice([1, 3])
-                if kernel_size > 1:
-                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-                    img = cv2.erode(img, kernel, iterations=1)
-                
-                # 4. 二值化
-                _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
-                
-                images.append(img)
-                labels.append(char_to_label[char])
-        
-        return np.array(images), np.array(labels)
-    
-    def _extract_hog_features(self, images: np.ndarray) -> np.ndarray:
-        """
-        提取 HOG 特征
-        Args:
-            images: 归一化后的字符图像列表
-        
-        Returns:
-            hog_features: HOG 特征向量
-        """
-        if self.hog_descriptor is None:
-            # 初始化 HOG 描述器
-            winSize = (64, 64)
-            blockSize = (16, 16)
-            blockStride = (8, 8)
-            cellSize = (8, 8)
-            nbins = 9
+            image: 输入图像（二值化），如果为 None 则使用 self.enhanced_image
             
-            self.hog_descriptor = cv2.HOGDescriptor(winSize, blockSize, blockStride, cellSize, nbins)
-        
-        hog_features = []
-        for img in images:
-            # 计算 HOG 特征
-            hog_feature = self.hog_descriptor.compute(img)
-            hog_features.append(hog_feature.flatten())
-        
-        return np.array(hog_features)
-    
-    def _train_classifier(self, num_samples_per_char: int = 30):
-        """
-        训练 HOG+SVM 分类器
-        """
-        print("  训练 HOG+SVM 分类器...")
-        
-        # 生成合成数据集
-        images, labels = self._generate_synthetic_dataset(num_samples_per_char)
-        
-        # 提取 HOG 特征
-        features = self._extract_hog_features(images)
-        
-        # 训练 SVM
-        svm = cv2.ml.SVM_create()
-        svm.setType(cv2.ml.SVM_C_SVC)
-        svm.setKernel(cv2.ml.SVM_LINEAR)
-        svm.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 1000, 1e-6))
-        
-        svm.train(features.astype(np.float32), cv2.ml.ROW_SAMPLE, labels.astype(np.int32))
-        
-        self.classifier = svm
-        self.class_labels = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        self.is_trained = True
-        
-        print(f"  分类器训练完成，支持 {len(self.class_labels)} 个字符")
-    
-    def stage4_hog_svm_recognition(self, char_images: List[np.ndarray]) -> str:
-        """
-        第四阶段：使用 HOG+SVM 进行字符识别
-        Args:
-            char_images: 归一化后的字符图像列表
-        
         Returns:
-            识别出的字符串
+            形态学处理后的图像，如果处理失败则返回 None
         """
-        if not self.is_trained:
-            self._train_classifier()
+        if image is None:
+            if self.enhanced_image is None:
+                print("  错误: 没有可用的增强图像")
+                return None
+            image = self.enhanced_image
         
-        if not char_images:
-            return ""
+        height, width = image.shape
+        print(f"  开始形态学处理: 图像尺寸 {width}x{height}")
         
-        # 准备输入图像
-        images_array = np.array(char_images)
+        # 检查图像是否需要反转（确保字符为白色，背景为黑色）
+        # 计算白色像素比例
+        white_pixels = np.sum(image == 255)
+        total_pixels = image.size
+        white_ratio = white_pixels / total_pixels
+        print(f"  图像白色像素比例: {white_ratio:.3f}")
         
-        # 提取 HOG 特征
-        features = self._extract_hog_features(images_array)
+        working_image = image.copy()
+        # 如果白色像素比例 > 0.5，可能背景是白色，需要反转
+        if white_ratio > 0.5:
+            print("  图像反转（使字符为白色，背景为黑色）")
+            working_image = cv2.bitwise_not(working_image)
         
-        # 预测
-        _, predictions = self.classifier.predict(features.astype(np.float32))
-        predictions = predictions.flatten().astype(int)
+        # 1. 形态学操作强制连接点阵字符成块
+        # 首先进行开运算去除小噪声
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_open_kernel'))
+        opened_image = cv2.morphologyEx(working_image, cv2.MORPH_OPEN, kernel_open, 
+                                       iterations=self.cfg['stage5_open_iterations'])
         
-        # 转换为字符
-        result = ""
-        for pred in predictions:
-            if 0 <= pred < len(self.class_labels):
-                result += self.class_labels[pred]
-            else:
-                result += "?"
+        # 横向腐蚀：收缩点阵字符的横向宽度，使字符间隙更清晰，便于垂直投影分割
+        kernel_h_erosion = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_h_erosion_kernel'))
+        eroded_image = cv2.erode(opened_image, kernel_h_erosion,
+                                 iterations=self.cfg['stage5_h_erosion_iterations'])
         
-        return result
+        # 再进行闭运算填充内部空隙，形成字符块
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_close_kernel'))
+        closed_image = cv2.morphologyEx(eroded_image, cv2.MORPH_CLOSE, kernel_close, 
+                                       iterations=self.cfg['stage5_close_iterations'])
+        
+        # 保存形态学处理后的图像用于调试
+        cv2.imwrite(os.path.join(self.output_dir, "morphology_result.png"), closed_image)
+        print(f"  形态学处理结果已保存到 morphology_result.png")
+        self.morph_image = closed_image  # 保存 morphology 结果用于后续检测
+        
+        return closed_image
     
     # ==================== 完整处理流程 ====================
     def full_pipeline(self, image_path: str) -> str:
@@ -977,27 +958,51 @@ class TireOCR:
         print(f"处理完成: 生成增强图像 {self.enhanced_image.shape}，已保存为 3_enhanced.png")
         return "成功生成增强图像"
     
-    def _save_final_result(self, result: str):
-        """保存最终识别结果图像"""
-        if self.label_binary is None or not self.char_positions:
-            return
+    def full_contours_pipeline(self, image_path: str) -> str:
+        """
+        完整轮廓检测处理流程：运行所有阶段，生成完整输出
+        Args:
+            image_path: 输入图像路径
+            
+        Returns:
+            处理状态字符串（非识别结果）
+        """
+        print("=== 开始完整轮廓检测处理流程 ===")
         
-        # 创建结果图像
-        result_img = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
+        # 第一阶段：ROI提取与预处理
+        print("\n=== 第一阶段：ROI提取 ===")
+        enhanced = self.stage1_extract_roi(image_path)
+        if enhanced is None:
+            print("第一阶段失败：未发现编号区域")
+            return ""
         
-        # 绘制边界框和标签
-        for idx, (left, top, right, bottom) in enumerate(self.char_positions):
-            cv2.rectangle(result_img, (left, top), (right, bottom), (0, 255, 0), 2)
-            if idx < len(result):
-                cv2.putText(result_img, result[idx], (left, top-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        # 可视化第一阶段结果
+        self.stage1_visualize()
+        print("第一阶段完成，生成: 1_binary.png, 2_roi.png, 3_enhanced.png, stage1_result.png")
         
-        # 添加整体识别结果文本
-        cv2.putText(result_img, f"识别结果: {result}", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        # 第二阶段：标签区域定位
+        print("\n=== 第二阶段：标签区域定位 ===")
+        label_binary = self.stage2_label_localization()
+        if label_binary is None:
+            print("第二阶段失败：无法定位标签区域")
+            return ""
         
-        cv2.imwrite(os.path.join(self.output_dir, "6_final_result.png"), result_img)
-        print(f"  最终结果已保存到 {self.output_dir}/6_final_result.png")
+        # 可视化第二阶段结果
+        self.stage2_visualize()
+        print("第二阶段完成，生成: stage2_result.png")
+        
+        # 第四阶段：形态学处理输出
+        print("\n=== 第四阶段：形态学处理输出 ===")
+        morphology_result = self.stage4_morphology_prepare()
+        
+        if morphology_result is not None:
+            print(f"  形态学处理完成，结果尺寸: {morphology_result.shape}")
+            print("第四阶段完成，生成: morphology_result.png")
+            print(f"处理完成，所有输出文件保存在: {self.output_dir}/")
+            return "形态学处理完成"
+        else:
+            print("第四阶段失败：形态学处理异常")
+            return ""
     
     def run_and_visualize(self, image_path: str):
         """
@@ -1016,32 +1021,79 @@ class TireOCR:
         print(f"关键输出: 3_enhanced.png (尺寸: {self.enhanced_image.shape if hasattr(self, 'enhanced_image') and self.enhanced_image is not None else 'N/A'})")
         
         return result
+    
+    def run_full_contours_pipeline(self, image_path: str):
+        """
+        运行完整轮廓检测流程并生成所有输出
+        """
+        result = self.full_contours_pipeline(image_path)
+        
+        if result:
+            print(f"\n=== 完整处理流程成功 ===")
+            print(f"处理状态: {result}")
+            print(f"所有输出文件保存在: {self.output_dir}/")
+            print(f"关键输出文件:")
+            print(f"  - 1_binary.png: 全局二值化图像")
+            print(f"  - 2_roi.png: 胎面区域图像")
+            print(f"  - 3_enhanced.png: 增强后图像")
+            print(f"  - stage1_result.png: 第一阶段可视化")
+            print(f"  - stage2_result.png: 第二阶段可视化")
+            print(f"  - morphology_result.png: 形态学处理结果")
+        else:
+            print(f"\n=== 处理失败 ===")
+        
+        return result
 
 
 def main():
-    """主函数，演示重构后的处理流程"""
+    """主函数，演示完整的前处理流程（截止形态学输出）"""
     import sys
     
     # 检查参数
     if len(sys.argv) < 2:
-        print("用法: python tire_ocr.py <图像路径>")
-        print("示例: python tire_ocr.py data/20250115083551210.png")
+        print("用法: python tire_ocr.py <图像路径> [模式]")
+        print("示例:")
+        print("  python tire_ocr.py data/20250115083551210.png             # 默认运行完整流程（至形态学输出）")
+        print("  python tire_ocr.py data/20250115083551210.png simple     # 只运行第一阶段（ROI提取）")
+        print("  python tire_ocr.py data/20250115083551210.png full       # 运行完整流程（至形态学输出）")
         sys.exit(1)
     
     image_path = sys.argv[1]
+    mode = "full"  # 默认模式：完整流程
     
-    # 创建 OCR 处理器
+    if len(sys.argv) > 2:
+        mode = sys.argv[2].lower()
+    
+    # 创建处理器
     ocr = TireOCR()
     
     try:
-        # 执行完整流程
-        result = ocr.run_and_visualize(image_path)
+        if mode == "simple":
+            print("=== 运行简化流程（只处理第一阶段）===")
+            result = ocr.run_and_visualize(image_path)
+        elif mode == "full":
+            print("=== 运行完整流程（至形态学输出）===")
+            result = ocr.run_full_contours_pipeline(image_path)
+        else:
+            print(f"未知模式: {mode}，使用默认完整模式")
+            result = ocr.run_full_contours_pipeline(image_path)
         
+        # 处理完成后调用后处理脚本 post_vertical_projection.py（无参数）
+        try:
+            post_script = os.path.join(os.path.dirname(__file__), "post_vertical_projection.py")
+            if os.path.exists(post_script):
+                print("运行后处理脚本: post_vertical_projection.py")
+                subprocess.run([sys.executable, post_script], check=False)
+            else:
+                print("未找到 post_vertical_projection.py，跳过后处理。")
+        except Exception as ex:
+            print(f"调用后处理脚本失败: {ex}")
     except Exception as e:
         print(f"处理失败: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    
 
 
 if __name__ == "__main__":
