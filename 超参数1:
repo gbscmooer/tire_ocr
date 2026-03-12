@@ -1,3 +1,0 @@
-tire_ocr:
-            'stage5_h_erosion_kernel': (5, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
-            'stage5_h_erosion_iterations':2,    # 横向腐蚀迭代次数

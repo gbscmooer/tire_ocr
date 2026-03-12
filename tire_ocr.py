@@ -43,7 +43,7 @@ class TireOCR:
             'stage5_close_kernel': (1, 15),       # 调整为垂直方向连接
             'stage5_close_iterations': 1,
             'stage5_h_erosion_kernel': (3, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
-            'stage5_h_erosion_iterations':2,    # 横向腐蚀迭代次数
+            'stage5_h_erosion_iterations':4,    # 横向腐蚀迭代次数
             
             # 轮廓过滤参数
             'contour_min_w': 8,
@@ -126,6 +126,7 @@ class TireOCR:
         # 第一步：找到编号区域（白色文字区域）的左右边界
         label_left = None
         label_right = None
+        min_valid_roi_width = 100  # ROI最小合法宽度（右边界-左边界）
         current_x = center_x
         
         # 状态机：0-寻找右边界，1-寻找左边界
@@ -175,9 +176,25 @@ class TireOCR:
                                 check_count += 1
                         
                         if all_valid and check_count == 15:  # 所有10列都满足条件
-                            label_left = current_x + 2  # 取最早的一列
-                            print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，所有列黑色像素比例均>99.5%")
-                            break
+                            candidate_left = current_x + 2  # 取最早的一列
+                            candidate_width = (label_right - candidate_left) if label_right is not None else 0
+                            if candidate_width < min_valid_roi_width:
+                                # ROI过窄：重置右边界为待定，从当前左边界位置重新向左扫描
+                                print(
+                                    f"  候选左边界 {candidate_left} 非法: 宽度={candidate_width}<"
+                                    f"{min_valid_roi_width}，重置右边界并继续扫描"
+                                )
+                                label_left = None
+                                label_right = None
+                                state = 0
+                                consecutive_label_cols = 0
+                                consecutive_tread_cols = 0
+                                current_x = candidate_left
+                                continue
+                            else:
+                                label_left = candidate_left
+                                print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，所有列黑色像素比例均>99.5%")
+                                break
                         
                         # 检查范围是否有效
                         total_black_ratio = 0
@@ -191,9 +208,25 @@ class TireOCR:
                         if check_count > 0:
                             avg_black_ratio = total_black_ratio / check_count
                             if avg_black_ratio > 0.995:  # 平均黑色像素比例必须非常高，说明确实是胎面区域
-                                label_left = current_x + 2  # 取最早的一列
-                                print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，平均黑色像素比例={avg_black_ratio:.3f}")
-                                break
+                                candidate_left = current_x + 2  # 取最早的一列
+                                candidate_width = (label_right - candidate_left) if label_right is not None else 0
+                                if candidate_width < min_valid_roi_width:
+                                    # ROI过窄：重置右边界为待定，从当前左边界位置重新向左扫描
+                                    print(
+                                        f"  候选左边界 {candidate_left} 非法: 宽度={candidate_width}<"
+                                        f"{min_valid_roi_width}，重置右边界并继续扫描"
+                                    )
+                                    label_left = None
+                                    label_right = None
+                                    state = 0
+                                    consecutive_label_cols = 0
+                                    consecutive_tread_cols = 0
+                                    current_x = candidate_left
+                                    continue
+                                else:
+                                    label_left = candidate_left
+                                    print(f"  发现编号区域左边界: {label_left}, 连续{consecutive_tread_cols}列，平均黑色像素比例={avg_black_ratio:.3f}")
+                                    break
                 else:
                     consecutive_tread_cols = 0  # 重置计数
                     
@@ -221,8 +254,18 @@ class TireOCR:
                             state = 1
                 elif state == 1:
                     if black_ratio > 0.95:  # 放宽阈值
-                        label_left = current_x
-                        break
+                        candidate_left = current_x
+                        candidate_width = (label_right - candidate_left) if label_right is not None else 0
+                        if candidate_width < min_valid_roi_width:
+                            # ROI过窄：重置右边界为待定，从当前左边界位置重新向左扫描
+                            label_left = None
+                            label_right = None
+                            state = 0
+                            current_x = candidate_left
+                            continue
+                        else:
+                            label_left = candidate_left
+                            break
                         
                 current_x -= 1
         
@@ -1078,6 +1121,11 @@ def main():
             print(f"未知模式: {mode}，使用默认完整模式")
             result = ocr.run_full_contours_pipeline(image_path)
         
+        # 如果第一阶段失败（未生成增强图像），则直接结束并跳过后续处理
+        if ocr.enhanced_image is None:
+            print("检测到第一阶段失败：未发现编号区域，程序终止，跳过后续处理。")
+            return
+
         # 处理完成后调用后处理脚本 post_vertical_projection.py（无参数）
         try:
             post_script = os.path.join(os.path.dirname(__file__), "post_vertical_projection.py")

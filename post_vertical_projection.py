@@ -17,9 +17,9 @@ CFG = {
     # 二值掩码阈值因子：阈值 = BINARY_THRESH_FACTOR * max(projection)
     "BINARY_THRESH_FACTOR": 0.01,
     # 合并相近区间的距离（像素列），若两个区间间距小于该值则合并
-    "MERGE_DISTANCE": 5,
+    "MERGE_DISTANCE": 3,
     # 过滤噪声的最小宽度（像素列），小于该宽度的连通区间会被丢弃
-    "MIN_WIDTH": 10,
+    "MIN_WIDTH": 5,
     # 高斯平滑核大小（奇数），建议 5,7,11
     "GAUSSIAN_KERNEL": 5,
     # 高斯平滑的标准差
@@ -29,7 +29,12 @@ CFG = {
     # 非线性增强参数：gamma<1 可抬升低幅波峰、压缩高峰动态范围
     "NONLINEAR_GAMMA": 0.15,
     # 局部对比度窗口（像素列，建议奇数）
-    "LOCAL_CONTRAST_WINDOW": 41,
+    "LOCAL_CONTRAST_WINDOW": 31,
+    # 字符切割相关参数
+    "CHAR_SEP_GAP": 50,      # 峰间距超过此值视为字符边界（px）—用于普通字符检测
+    "SPECIAL_GAP": 80,       # 用于"1"/"-"检测的峰间距阈值（px）
+    "SPACE_GAP": 400,        # 峰间距超过此值插入空格段（px）
+    "RATIO_271_TOL": 0.12,   # "1" 的高度比容差（每个分量绝对偏差）
 }
 
 # --------------------------------------------------------------
@@ -269,7 +274,7 @@ def merge_and_plot(image_paths, out_path):
             if peaks0:
                 xs = [p[0] for p in peaks0]
                 ys = [p[1] for p in peaks0]
-                ax_proj.scatter(xs, ys, color='red', zorder=3, s=20, label='Peaks')
+                ax_proj.scatter(xs, ys, color='red', zorder=3, s=5, label='Peaks')
                 printable = [(round(float(x), 2), round(float(y), 4)) for x, y in peaks0]
                 print(f"Peaks for {p0}: {printable}")
 
@@ -347,6 +352,267 @@ def merge_and_plot(image_paths, out_path):
     plt.close(fig)
 
 
+def classify_peaks_to_chars(peaks, img_width):
+    """
+    根据 peaks 的横坐标和高度，使用状态机将 peaks 分组为字符。
+    
+    字符规则（根据用户要求）：
+    - "1"：gap ≥ CHAR_SEP_GAP（50px）前无波峰，3个波峰高度比 2:7:1，gap ≥ CHAR_SEP_GAP 后无波峰
+    - "-"：gap ≥ CHAR_SEP_GAP（50px）前无波峰，3个波峰高度比 1:1:1，gap ≥ CHAR_SEP_GAP 后无波峰
+    - 正常字符：5个波峰（采用滑动窗口扫描，连续5峰且峰间距<80px）
+    - 空格：gap ≥ SPACE_GAP（150px）
+    
+    返回 list of dict:
+    {
+      'type': '1' | '-' | 'char' | 'space' | 'unknown',
+      'x_start': int,
+      'x_end': int,
+      'peaks': [(x, h), ...]  # peaks belonging to this segment (empty for space)
+    }
+    """
+    if not peaks:
+        return []
+    
+    CHAR_SEP_GAP = float(CFG.get("CHAR_SEP_GAP", 50))
+    NORMAL_CHAR_GAP = 80.0  # 普通字符检测阈值：峰间距<80px
+    SPACE_GAP = float(CFG.get("SPACE_GAP", 150))
+    RATIO_271_TOL = float(CFG.get("RATIO_271_TOL", 0.12))
+    
+    # Sort peaks by x
+    peaks = sorted(peaks, key=lambda p: p[0])
+    n = len(peaks)
+    xs = [float(p[0]) for p in peaks]
+    hs = [float(p[1]) for p in peaks]
+    
+    def is_ratio_271(h0, h1, h2):
+        total = h0 + h1 + h2
+        if total <= 0:
+            return False
+        r0, r1, r2 = h0/total, h1/total, h2/total
+        # 2:7:1 -> 2/10=0.2, 7/10=0.7, 1/10=0.1
+        return (abs(r0 - 0.2) <= RATIO_271_TOL and
+                abs(r1 - 0.7) <= RATIO_271_TOL and
+                abs(r2 - 0.1) <= RATIO_271_TOL)
+    
+    def is_ratio_111(h0, h1, h2):
+        if min(h0, h1, h2) <= 0:
+            return False
+        # 1:1:1 means max/min ratio close to 1.0
+        max_h = max(h0, h1, h2)
+        min_h = min(h0, h1, h2)
+        # allow up to 1.5x difference (empirical)
+        # ADDITIONAL: each peak must be < 0.1 (height threshold)
+        if max_h >= 0.1:
+            return False
+        return max_h / min_h <= 1.5
+    
+    segments = []
+    i = 0
+    prev_x_end = 0  # right boundary of previous segment
+    
+    while i < n:
+        # Gap from previous segment end to current peak
+        gap_to_here = xs[i] - prev_x_end
+        
+        # 1. Space detection (highest priority)
+        if gap_to_here >= SPACE_GAP:
+            space_start = int(prev_x_end)
+            space_end = int(xs[i])
+            if space_end > space_start:
+                segments.append({
+                    'type': 'space',
+                    'x_start': space_start,
+                    'x_end': space_end,
+                    'peaks': []
+                })
+            # Move prev_x_end to the end of this space
+            prev_x_end = xs[i]
+            gap_to_here = 0.0
+        
+        # 2. Try to detect "1" or "-" (保持原来的算法：只检查比例，不检查gap)
+        # 原代码对于3峰组只检查比例，不检查前后gap
+        # 我们在这里尝试检测连续的3个峰，如果比例符合就识别
+        if i + 2 < n:
+            # 检查内部间距是否小于80px（普通字符阈值），如果太大则不是同一字符
+            inner_gap1 = xs[i+1] - xs[i]
+            inner_gap2 = xs[i+2] - xs[i+1]
+            if inner_gap1 < NORMAL_CHAR_GAP and inner_gap2 < NORMAL_CHAR_GAP:
+                h0, h1, h2 = hs[i], hs[i+1], hs[i+2]
+                if is_ratio_271(h0, h1, h2):
+                    # "1" character found
+                    # Determine boundaries: start from midpoint between previous and current, end at midpoint between current+2 and next
+                    if i == 0:
+                        x_start = 0
+                    else:
+                        x_start = int((xs[i-1] + xs[i]) / 2)
+                    x_end = int((xs[i+2] + (xs[i+3] if i+3 < n else img_width)) / 2)
+                    if x_end > x_start:
+                        segments.append({
+                            'type': '1',
+                            'x_start': x_start,
+                            'x_end': x_end,
+                            'peaks': peaks[i:i+3]
+                        })
+                    prev_x_end = x_end
+                    i += 3
+                    continue
+                elif is_ratio_111(h0, h1, h2):
+                    # "-" character found
+                    if i == 0:
+                        x_start = 0
+                    else:
+                        x_start = int((xs[i-1] + xs[i]) / 2)
+                    x_end = int((xs[i+2] + (xs[i+3] if i+3 < n else img_width)) / 2)
+                    if x_end > x_start:
+                        segments.append({
+                            'type': '-',
+                            'x_start': x_start,
+                            'x_end': x_end,
+                            'peaks': peaks[i:i+3]
+                        })
+                    prev_x_end = x_end
+                    i += 3
+                    continue
+        
+        # 3. 滑动窗口检测普通字符（5个波峰，每个波峰之间间隔<80px）
+        # 按照用户描述：左边界L停在第一个波峰，右边界R继续收集波峰
+        # 收集连续5个波峰，每个相邻波峰间距<80px
+        collected = [i]  # start with current peak
+        j = i
+        while j + 1 < n and len(collected) < 5:
+            if xs[j+1] - xs[j] < NORMAL_CHAR_GAP:
+                collected.append(j+1)
+                j += 1
+            else:
+                break
+        
+        count = len(collected)
+        
+        # Determine boundaries for this segment
+        # 左边界：如果是第一个字符，从0开始；否则取前一个字符的右边界
+        if i == 0:
+            x_start = 0
+        else:
+            # 取前一个波峰和当前第一个波峰的中点
+            x_start = int((xs[i-1] + xs[i]) / 2)
+        
+        # 右边界：如果是最后一个字符，到图像末尾；否则取当前最后一个波峰和下一个波峰的中点
+        if j == n - 1:
+            x_end = img_width
+        else:
+            x_end = int((xs[j] + xs[j+1]) / 2)
+        
+        # Ensure x_start is not before prev_x_end (use prev_x_end as floor)
+        x_start = max(int(prev_x_end), x_start)
+        if x_end <= x_start:
+            x_end = min(img_width, int(prev_x_end) + 10)  # fallback
+        
+        # Determine type based on count
+        if count == 5:
+            char_type = 'char'
+        elif count == 3:
+            # 可能是 "1" 或 "-"，但之前检查已经排除了（gap条件不满足）
+            # 这里再检查一次比例，但标记为 unknown3
+            h0, h1, h2 = hs[i], hs[i+1], hs[i+2] if i+2 < n else (0, 0, 0)
+            if is_ratio_271(h0, h1, h2) or is_ratio_111(h0, h1, h2):
+                # 即使gap条件不满足，也尝试标记为特殊字符
+                if is_ratio_271(h0, h1, h2):
+                    char_type = '1'
+                else:
+                    char_type = '-'
+            else:
+                char_type = 'unknown3'
+        else:
+            char_type = f'unknown{count}'
+        
+        # Create segment
+        segment_peaks = [peaks[idx] for idx in collected]
+        segments.append({
+            'type': char_type,
+            'x_start': x_start,
+            'x_end': x_end,
+            'peaks': segment_peaks
+        })
+        
+        # Update state
+        prev_x_end = x_end
+        i += count
+    
+    return segments
+
+
+def cut_characters(peaks, src_image_path, out_dir):
+    """
+    根据 peaks 信息对 src_image_path 进行字符切割，
+    保存切割结果到 out_dir。
+    
+    参数：
+        peaks: list of (x, height) from detect_and_cluster_peaks()
+        src_image_path: 要切割的图像路径（如 output/3_enhanced.png）
+        out_dir: 输出目录（如 output/characters/）
+    """
+    img = cv2.imread(src_image_path)
+    if img is None:
+        print(f"[cut_characters] Cannot load image: {src_image_path}")
+        return
+    
+    img_height, img_width = img.shape[:2]
+    
+    segments = classify_peaks_to_chars(peaks, img_width)
+    
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Clear previous results (PNG files only)
+    for f in os.listdir(out_dir):
+        if f.lower().endswith('.png'):
+            os.remove(os.path.join(out_dir, f))
+    
+    char_count = 0
+    summary = []
+    
+    for seg_idx, seg in enumerate(segments):
+        x_start = max(0, int(seg['x_start']))
+        x_end = min(img_width, int(seg['x_end']))
+        
+        if x_start >= x_end:
+            continue
+        
+        char_type = seg['type']
+        char_img = img[:, x_start:x_end]
+        
+        label = char_type.replace('unknown', 'unk')
+        out_name = f"{char_count:03d}_{label}.png"
+        out_full = os.path.join(out_dir, out_name)
+        cv2.imwrite(out_full, char_img)
+        
+        summary.append({
+            'index': char_count,
+            'type': char_type,
+            'x_start': x_start,
+            'x_end': x_end,
+            'width': x_end - x_start,
+            'num_peaks': len(seg['peaks'])
+        })
+        
+        print(f"  [{char_count:03d}] type={char_type:12s}, x=[{x_start}..{x_end}], w={x_end-x_start}, peaks={len(seg['peaks'])}")
+        char_count += 1
+    
+    # Also create a debug visualization showing the cuts on the original image
+    if char_count > 0:
+        debug_img = img.copy()
+        for seg in segments:
+            x1 = max(0, int(seg['x_start']))
+            x2 = min(img_width, int(seg['x_end']))
+            color = (255, 0, 0) if seg['type'] == 'space' else (0, 255, 0)
+            cv2.rectangle(debug_img, (x1, 0), (x2, img_height-1), color, 1)
+        debug_path = "output/character_cuts_debug.png"
+        cv2.imwrite(debug_path, debug_img)
+        print(f"\nDebug visualization saved to: {debug_path}")
+    
+    print(f"\ncut_characters: {char_count} segments saved to '{out_dir}'")
+    return summary
+
+
 def main():
     # 默认同时处理两个文件并将结果合并覆盖保存到同一文件
     srcs = ['output/morphology_result.png', 'output/3_enhanced.png']
@@ -364,6 +630,48 @@ def main():
 
     merge_and_plot(srcs, dst)
     print(f"Saved merged vertical projection image to: {dst}")
+
+    # NOTE: KNN invocation moved to after character cutting to ensure
+    # output/characters exists and is populated. See bottom of this main().
+    
+    # ---- NEW: 字符切割 ----
+    morphology_path = 'output/morphology_result.png'
+    enhanced_path = 'output/3_enhanced.png'
+    cut_dir = 'output/characters'
+    
+    if os.path.exists(morphology_path) and os.path.exists(enhanced_path):
+        _, proj_morph = vertical_projection(morphology_path, None)
+        peaks_for_cut = detect_and_cluster_peaks(
+            proj_morph,
+            binary_thresh_factor=CFG["BINARY_THRESH_FACTOR"],
+            merge_distance=CFG["MERGE_DISTANCE"],
+            min_width=CFG["MIN_WIDTH"],
+            gaussian_k=CFG.get("GAUSSIAN_KERNEL", 11),
+            gaussian_sigma=CFG.get("GAUSSIAN_SIGMA", 2.0),
+        )
+        print(f"\nSegmenting characters using {len(peaks_for_cut)} peaks...")
+        cut_characters(peaks_for_cut, enhanced_path, cut_dir)
+    else:
+        print(f"[main] Skipping character cut: required images not found.")
+
+    # ---- Run KNN-based recognition (optional) ----
+    # Only run KNN after characters have been cut and the folder exists and is non-empty.
+    try:
+        if os.path.exists(cut_dir) and any(f.lower().endswith('.png') for f in os.listdir(cut_dir)):
+            try:
+                import KNN
+                if hasattr(KNN, 'main'):
+                    print("Running KNN recognition (KNN.py)...")
+                    try:
+                        KNN.main()
+                    except Exception as _knn_err:
+                        print(f"KNN.main() failed: {_knn_err}")
+            except Exception as _imp_err:
+                print(f"Failed to import/run KNN.py: {_imp_err}")
+        else:
+            print("KNN skipped: 'output/characters' not found or empty.")
+    except Exception as _e:
+        print(f"KNN execution check failed: {_e}")
 
 
 if __name__ == '__main__':
