@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 import os
-import matplotlib.pyplot as plt
-from typing import List, Tuple, Optional
-import subprocess
+import threading
+import queue
+import time
+from typing import Tuple, Optional
 
 class TireOCR:
     """橡胶胎面点阵字符识别主类"""
@@ -38,12 +39,14 @@ class TireOCR:
             # Stage5 形态学参数 (字符连通) - 降权避免横向粘连
             'stage5_open_kernel': (5, 1),        # 轻量开运算去噪
             'stage5_open_iterations': 1,
-            'stage5_dilation_kernel': (1, 7),    # 窄宽度，重点垂直连接（原(9,3)太宽）
+            'stage5_dilation_kernel': (1,1),    # 窄宽度，重点垂直连接（原(9,3)太宽）
             'stage5_dilation_iterations': 1,
-            'stage5_close_kernel': (1, 15),       # 调整为垂直方向连接
+            'stage5_close_kernel': (1, 2),       # 调整为垂直方向连接
             'stage5_close_iterations': 1,
             'stage5_h_erosion_kernel': (3, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
             'stage5_h_erosion_iterations':4,    # 横向腐蚀迭代次数
+            'stage5_v_erosion_kernel': (1, 3),   # 纵向腐蚀核：收缩点阵字符纵向高度，分开纵向粘连
+            'stage5_v_erosion_iterations':3,    # 纵向腐蚀迭代次数
             
             # 轮廓过滤参数
             'contour_min_w': 8,
@@ -71,6 +74,8 @@ class TireOCR:
             'white_pixel_ratio_invert': 0.5,   # 白色像素比例超过此值则反转图像
             'white_pixel_ratio_low': 0.1,      # 白色像素比例低于此值则检查反转
             'white_pixel_ratio_label': 0.05,   # 编号区域白色像素比例阈值
+            # 全局调试开关，True 时会输出中间产物并启用额外调试绘图
+            'debug': False,
         }
         
         # 存储中间结果
@@ -78,8 +83,7 @@ class TireOCR:
         self.binary_image = None            # 二值化图像
         self.tread_roi_image = None         # 胎面区域图像（黑色区域）
         self.enhanced_image = None          # 增强后图像
-        self.tophat_image = None            # Top-Hat 变换结果
-        self.morph_image = None             # 形态学处理结果
+    # (tophat intermediate not used in current pipeline)
         self.segmented_chars = []           # 分割后的字符图像列表
         self.char_positions = []            # 字符在原图中的位置
         self.label_roi_image = None         # 标签区域图像（白色长条）
@@ -93,8 +97,7 @@ class TireOCR:
         self.label_left_relative = None     # 编号区域在胎面ROI中的相对左偏移
         self.label_right_relative = None    # 编号区域在胎面ROI中的相对右偏移
 
-        # 形态学处理结果
-        self.morph_image = None             # 形态学处理后的图像
+    # 形态学处理结果 (initialized in stage4)
     
     # ==================== 第一阶段：ROI 提取与预处理 ====================
     def stage1_extract_roi(self, image_path: str) -> np.ndarray:
@@ -110,10 +113,13 @@ class TireOCR:
         Returns:
             胎面 ROI 增强后的图像 (尺寸: 2396x229)
         """
-        # 读取图像
-        self.original_image = cv2.imread(image_path)
-        if self.original_image is None:
-            raise FileNotFoundError(f"无法读取图像: {image_path}")
+        # 读取图像：支持传入文件路径或已加载的 numpy 图像
+        if isinstance(image_path, np.ndarray):
+            self.original_image = image_path.copy()
+        else:
+            self.original_image = cv2.imread(image_path)
+            if self.original_image is None:
+                raise FileNotFoundError(f"无法读取图像: {image_path}")
         
         # 1. 全局二值化（Otsu）
         gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
@@ -428,50 +434,14 @@ class TireOCR:
         # 顺时针旋转90度（原始尺寸229x2396 -> 旋转后2396x229）
         self.enhanced_image = cv2.rotate(self.enhanced_image, cv2.ROTATE_90_CLOCKWISE)
         
-        # 保存中间结果
-        cv2.imwrite(os.path.join(self.output_dir, "1_binary.png"), self.binary_image)
-        
-        # 保存裁剪前的胎面区域用于对比
-        tread_full_height = self.original_image[:, left_bound:right_bound]
-        cv2.imwrite(os.path.join(self.output_dir, "2_roi_full.png"), tread_full_height)
-        cv2.imwrite(os.path.join(self.output_dir, "2_roi.png"), self.tread_roi_image)
-        cv2.imwrite(os.path.join(self.output_dir, "3_enhanced.png"), self.enhanced_image)
+        # 保存最终增强图像（根据 cfg['debug'] 决定是否写盘）
+        if self.cfg.get('debug', False):
+            cv2.imwrite(os.path.join(self.output_dir, "3_enhanced.png"), self.enhanced_image)
+            print(f"  增强图像已保存到 3_enhanced.png")
+        else:
+            print(f"  增强图像已生成（未写入磁盘，debug=False）")
         
         return self.enhanced_image
-    
-    def stage1_visualize(self):
-        """可视化第一阶段处理结果"""
-        if self.original_image is None:
-            print("请先运行 stage1_extract_roi()")
-            return
-        
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # Original image
-        axes[0, 0].imshow(cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB))
-        axes[0, 0].set_title("Original Image")
-        axes[0, 0].axis('off')
-        
-        # Binary image
-        axes[0, 1].imshow(self.binary_image, cmap='gray')
-        axes[0, 1].set_title("Binary Image (Otsu)")
-        axes[0, 1].axis('off')
-        
-        # Tread ROI image
-        if self.tread_roi_image is not None:
-            axes[1, 0].imshow(cv2.cvtColor(self.tread_roi_image, cv2.COLOR_BGR2RGB))
-            axes[1, 0].set_title(f"Tread Region ({self.tread_roi_image.shape[1]}x{self.tread_roi_image.shape[0]})")
-            axes[1, 0].axis('off')
-        
-        # Enhanced image
-        if self.enhanced_image is not None:
-            axes[1, 1].imshow(self.enhanced_image, cmap='gray')
-            axes[1, 1].set_title("Binary + Rotated (2396x229)")
-            axes[1, 1].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, "stage1_result.png"), dpi=150)
-        plt.show()
     
     # ==================== 第二阶段：标签区域定位（优先使用第一阶段结果） ====================
     def stage2_label_localization(self) -> Optional[np.ndarray]:
@@ -643,271 +613,9 @@ class TireOCR:
         
         return self.label_binary
     
-    def stage2_visualize(self):
-        """可视化第二阶段处理结果"""
-        if self.enhanced_image is None or self.label_binary is None:
-            print("请先运行 stage2_label_localization()")
-            return
-        
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # Enhanced image
-        axes[0, 0].imshow(self.enhanced_image, cmap='gray')
-        axes[0, 0].set_title("Enhanced Image (Input)")
-        axes[0, 0].axis('off')
-        
-        # Label ROI image
-        if self.label_roi_image is not None:
-            axes[0, 1].imshow(cv2.cvtColor(self.label_roi_image, cv2.COLOR_BGR2RGB))
-            axes[0, 1].set_title("Label Region ROI")
-            axes[0, 1].axis('off')
-        
-        # Binary label result
-        axes[1, 0].imshow(self.label_binary, cmap='gray')
-        axes[1, 0].set_title("Binary Label (after morphology)")
-        axes[1, 0].axis('off')
-        
-        # Histogram analysis
-        axes[1, 1].hist(self.enhanced_image.ravel(), 256, [0, 256])
-        axes[1, 1].set_title("Enhanced Image Histogram")
-        axes[1, 1].set_xlabel("Pixel Value")
-        axes[1, 1].set_ylabel("Frequency")
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, "stage2_result.png"), dpi=150)
-        plt.show()
-    
-    # ==================== 第三阶段：字符区域分割（仅区域划分锁定） ====================
-    def stage3_character_segmentation(self) -> List[np.ndarray]:
-        """
-        第三阶段：字符区域分割
-        使用垂直投影法分割字符，适用于点阵字符
-        
-        Returns:
-            归一化后的字符图像列表，若无标签则返回空列表
-        """
-        if self.label_binary is None:
-            print("  无标签区域，跳过字符分割")
-            self.segmented_chars = []
-            self.char_positions = []
-            return []
-        
-        print("  开始标签内字符区域分割（垂直投影法）...")
-        binary = self.label_binary.copy()
-        height, width = binary.shape
-        
-        # 计算垂直投影（每列白色像素数量）
-        vertical_projection = np.sum(binary > 0, axis=0)
-        
-        # 平滑投影曲线，去除噪声
-        kernel_size = 5
-        kernel = np.ones(kernel_size) / kernel_size
-        smoothed_projection = np.convolve(vertical_projection, kernel, mode='same')
-        
-        # 计算阈值：使用平均值的1.5倍作为字符阈值
-        mean_projection = np.mean(smoothed_projection)
-        char_threshold = mean_projection * 1.5
-        
-        # 标记字符列
-        char_cols = smoothed_projection > char_threshold
-        
-        # 找到字符区域（连续的字符列）
-        regions = []
-        in_char = False
-        start = 0
-        
-        for i in range(len(char_cols)):
-            if char_cols[i] and not in_char:
-                in_char = True
-                start = i
-            elif not char_cols[i] and in_char:
-                in_char = False
-                end = i - 1
-                width_px = end - start + 1
-                # 只保留宽度在合理范围内的区域
-                if 5 <= width_px <= 30:
-                    regions.append((start, end, width_px))
-        
-        # 处理最后一个区域
-        if in_char:
-            end = len(char_cols) - 1
-            width_px = end - start + 1
-            if 5 <= width_px <= 30:
-                regions.append((start, end, width_px))
-        
-        print(f"  找到 {len(regions)} 个候选字符区域")
-        
-        self.segmented_chars = []
-        self.char_positions = []
-        
-        for idx, (start_col, end_col, region_width) in enumerate(regions):
-            # 提取字符区域
-            # 水平方向：取整个高度（字符通常垂直占满）
-            char_img = binary[:, start_col:end_col+1]
-            
-            # 裁剪上下空白
-            horizontal_proj = np.sum(char_img > 0, axis=1)
-            # 找到有字符的行
-            char_rows = horizontal_proj > 0
-            if np.any(char_rows):
-                top = np.where(char_rows)[0][0]
-                bottom = np.where(char_rows)[0][-1]
-                # 稍微扩展一点
-                top = max(0, top - 2)
-                bottom = min(height - 1, bottom + 2)
-                char_img = char_img[top:bottom+1, :]
-            
-            # 裁剪左右空白
-            vertical_proj = np.sum(char_img > 0, axis=0)
-            char_cols_img = vertical_proj > 0
-            if np.any(char_cols_img):
-                left = np.where(char_cols_img)[0][0]
-                right = np.where(char_cols_img)[0][-1]
-                # 稍微扩展一点
-                left = max(0, left - 1)
-                right = min(char_img.shape[1] - 1, right + 1)
-                char_img = char_img[:, left:right+1]
-            
-            if char_img.size == 0:
-                continue
-            
-            # 归一化处理
-            normalized_char = self._normalize_char(char_img)
-            
-            # 保存位置信息（相对于原始label_binary）
-            final_left = start_col
-            final_top = 0
-            final_right = end_col + 1
-            final_bottom = height - 1
-            
-            self.segmented_chars.append(normalized_char)
-            self.char_positions.append((final_left, final_top, final_right, final_bottom))
-            
-            print(f"    字符区域 {idx}: 列 {start_col}-{end_col}, 宽度={region_width}, 裁剪后尺寸={char_img.shape}")
-        
-        print(f"  分割出 {len(self.segmented_chars)} 个有效字符区域")
-        
-        # 保存分割结果图像
-        if self.segmented_chars:
-            # 绘制带有边界框的图像
-            img_with_boxes = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
-            for idx, (left, top, right, bottom) in enumerate(self.char_positions):
-                cv2.rectangle(img_with_boxes, (left, top), (right, bottom), (0, 255, 0), 2)
-                cv2.putText(img_with_boxes, str(idx), (left, top-5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-            cv2.imwrite(os.path.join(self.output_dir, "5_segmented_chars.png"), img_with_boxes)
-        
-        return self.segmented_chars
-    
-    def _normalize_char(self, char_img: np.ndarray, target_size: int = 64) -> np.ndarray:
-        """
-        将字符图像归一化为固定大小
-        """
-        # 检查输入图像是否有效
-        if char_img.size == 0:
-            # 返回全黑图像
-            return np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        # 添加 padding，保持宽高比
-        h, w = char_img.shape
-        
-        # 确保高度和宽度大于0
-        if h <= 0 or w <= 0:
-            return np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        # 计算缩放比例，避免除零
-        scale_h = target_size / h if h > 0 else 0
-        scale_w = target_size / w if w > 0 else 0
-        scale = min(scale_h, scale_w)
-        
-        # 确保缩放比例有效
-        if scale <= 0:
-            return np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        new_h, new_w = int(h * scale), int(w * scale)
-        
-        # 确保新尺寸大于0
-        if new_h <= 0 or new_w <= 0:
-            return np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        # 缩放图像
-        resized = cv2.resize(char_img, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-        
-        # 创建目标图像，填充为背景色（黑色）
-        normalized = np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        # 计算放置位置（居中）
-        y_offset = (target_size - new_h) // 2
-        x_offset = (target_size - new_w) // 2
-        
-        # 放置字符
-        normalized[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-        
-        return normalized
-    
-    def stage3_visualize(self):
-        """可视化第三阶段处理结果"""
-        if not self.segmented_chars:
-            print("请先运行 stage3_character_segmentation()")
-            return
-        
-        # Create visualization image
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # 1. Original binary character image
-        if self.label_binary is not None:
-            axes[0, 0].imshow(self.label_binary, cmap='gray')
-            axes[0, 0].set_title("Binary Label Image")
-            axes[0, 0].axis('off')
-            
-            # Draw character bounding boxes on image
-            img_with_boxes = cv2.cvtColor(self.label_binary, cv2.COLOR_GRAY2RGB)
-            for idx, (left, top, right, bottom) in enumerate(self.char_positions):
-                cv2.rectangle(img_with_boxes, (left, top), (right, bottom), (0, 255, 0), 2)
-                cv2.putText(img_with_boxes, str(idx), (left, top-5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-            
-            axes[0, 1].imshow(img_with_boxes)
-            axes[0, 1].set_title(f"Character Bounding Boxes ({len(self.char_positions)} chars)")
-            axes[0, 1].axis('off')
-        
-        # 2. Display some segmented characters
-        num_chars_to_show = min(16, len(self.segmented_chars))
-        if num_chars_to_show > 0:
-            # Calculate grid size
-            grid_size = int(np.ceil(np.sqrt(num_chars_to_show)))
-            
-            # Create character grid
-            char_size = 64
-            margin = 5
-            grid_img = np.zeros((grid_size * (char_size + margin), 
-                                grid_size * (char_size + margin)), dtype=np.uint8)
-            
-            for i in range(num_chars_to_show):
-                row = i // grid_size
-                col = i % grid_size
-                y_start = row * (char_size + margin)
-                x_start = col * (char_size + margin)
-                grid_img[y_start:y_start+char_size, x_start:x_start+char_size] = self.segmented_chars[i]
-            
-            axes[1, 0].imshow(grid_img, cmap='gray')
-            axes[1, 0].set_title(f"Segmented Characters (first {num_chars_to_show})")
-            axes[1, 0].axis('off')
-        
-        # 3. Character size distribution
-        if self.char_positions:
-            widths = [right - left for left, _, right, _ in self.char_positions]
-            heights = [bottom - top for _, top, _, bottom in self.char_positions]
-            
-            axes[1, 1].scatter(widths, heights, alpha=0.6)
-            axes[1, 1].set_xlabel("Width (pixels)")
-            axes[1, 1].set_ylabel("Height (pixels)")
-            axes[1, 1].set_title("Character Size Distribution")
-            axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, "stage3_result.png"), dpi=150)
-        plt.show()
+    # (stage3_character_segmentation and its helper _normalize_char were removed
+    #  because the current pipeline performs segmentation via the post-processing
+    #  module. Keep the rest of the class focused on stages 1/2/4 and orchestration.)
 
     def _get_kernel_size(self, key: str) -> Tuple[int, int]:
         """读取并规范化形态学核尺寸，确保传给 OpenCV 的 ksize 为正整数元组。"""
@@ -922,6 +630,128 @@ class TireOCR:
             raise ValueError(f"配置项 {key} 含有非法核尺寸值: {raw}") from exc
 
         return (kx, ky)
+    
+    def waterfall_segmentation(self, image: np.ndarray) -> np.ndarray:
+        """
+        滴水算法分离粘连的字符
+        
+        基本思路：
+        1. 计算水平投影找到可能的分割位置
+        2. 在每个候选位置模拟水滴下落，找到最佳分割路径
+        3. 沿路径分割字符
+        
+        Args:
+            image: 输入二值图像（字符为白色255，背景为黑色0）
+            
+        Returns:
+            分离后的图像
+        """
+        h, w = image.shape
+        result = image.copy()
+        
+        # 1. 计算水平投影（垂直方向的像素和）
+        vertical_projection = np.sum(image > 0, axis=0).astype(np.int32)
+        
+        # 2. 找到波谷位置（候选分割点）
+        min_val = np.min(vertical_projection)
+        max_val = np.max(vertical_projection)
+        threshold = min_val + (max_val - min_val) * 0.2  # 波谷阈值
+        
+        # 找到所有低于阈值的列
+        candidate_cols = []
+        for col in range(1, w - 1):
+            if vertical_projection[col] < threshold:
+                # 检查是否是局部极小值
+                if vertical_projection[col] < vertical_projection[col - 1] and \
+                   vertical_projection[col] < vertical_projection[col + 1]:
+                    candidate_cols.append(col)
+        
+        if not candidate_cols:
+            return result
+        
+        print(f"  滴水算法: 找到 {len(candidate_cols)} 个候选分割点")
+        
+        # 3. 对每个候选点进行滴水分割
+        for col in candidate_cols:
+            # 从顶部开始模拟水滴下落
+            path = []
+            row = 0
+            current_col = col
+            
+            while row < h:
+                path.append((row, current_col))
+                
+                # 检查是否到达底部
+                if row >= h - 1:
+                    break
+                
+                # 决定下一步方向：左、下、右
+                left_col = max(0, current_col - 1)
+                right_col = min(w - 1, current_col + 1)
+                
+                # 计算三个方向的"高度"（白色像素数量）
+                down_height = 0
+                left_height = 0
+                right_height = 0
+                
+                # 向下方向
+                if row + 1 < h:
+                    if result[row + 1, current_col] > 0:
+                        down_height = 1
+                
+                # 向左下方向
+                if row + 1 < h and left_col >= 0:
+                    if result[row + 1, left_col] > 0:
+                        left_height = 1
+                
+                # 向右下方向
+                if row + 1 < h and right_col < w:
+                    if result[row + 1, right_col] > 0:
+                        right_height = 1
+                
+                # 选择方向：优先选择没有像素的方向（避开字符）
+                if down_height == 0:
+                    # 向下是空的，继续向下
+                    row += 1
+                elif left_height == 0 and right_height == 0:
+                    # 左右都是空的，选择离初始列更近的方向
+                    if abs(left_col - col) < abs(right_col - col):
+                        current_col = left_col
+                    else:
+                        current_col = right_col
+                    row += 1
+                elif left_height == 0:
+                    # 左边是空的
+                    current_col = left_col
+                    row += 1
+                elif right_height == 0:
+                    # 右边是空的
+                    current_col = right_col
+                    row += 1
+                else:
+                    # 三个方向都有像素，选择梯度最小的方向
+                    # 计算左右两侧的像素密度差
+                    left_density = np.sum(result[row, max(0, current_col-3):current_col] > 0)
+                    right_density = np.sum(result[row, current_col:min(w, current_col+3)] > 0)
+                    
+                    if left_density < right_density:
+                        current_col = max(0, current_col - 1)
+                    elif right_density < left_density:
+                        current_col = min(w - 1, current_col + 1)
+                    else:
+                        # 密度相等，向下
+                        pass
+                    row += 1
+            
+            # 4. 沿路径分割（将路径上的像素置为0）
+            for r, c in path:
+                # 只分割路径附近的像素（避免破坏字符结构）
+                for dc in range(-1, 2):
+                    nc = c + dc
+                    if 0 <= nc < w:
+                        result[r, nc] = 0
+        
+        return result
     
     # ==================== 第四阶段：形态学处理输出 ====================
     def stage4_morphology_prepare(self, image: np.ndarray = None) -> Optional[np.ndarray]:
@@ -964,19 +794,30 @@ class TireOCR:
         opened_image = cv2.morphologyEx(working_image, cv2.MORPH_OPEN, kernel_open, 
                                        iterations=self.cfg['stage5_open_iterations'])
         
+        # 滴水算法：分离粘连的字符（在腐蚀之前）
+        separated_image = self.waterfall_segmentation(opened_image)
+        
         # 横向腐蚀：收缩点阵字符的横向宽度，使字符间隙更清晰，便于垂直投影分割
         kernel_h_erosion = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_h_erosion_kernel'))
-        eroded_image = cv2.erode(opened_image, kernel_h_erosion,
+        eroded_image = cv2.erode(separated_image, kernel_h_erosion,
                                  iterations=self.cfg['stage5_h_erosion_iterations'])
+
+        # 纵向腐蚀：收缩点阵字符的纵向高度，分开纵向粘连的字符
+        kernel_v_erosion = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_v_erosion_kernel'))
+        eroded_image = cv2.erode(eroded_image, kernel_v_erosion,
+                                 iterations=self.cfg['stage5_v_erosion_iterations'])
         
         # 再进行闭运算填充内部空隙，形成字符块
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, self._get_kernel_size('stage5_close_kernel'))
         closed_image = cv2.morphologyEx(eroded_image, cv2.MORPH_CLOSE, kernel_close, 
                                        iterations=self.cfg['stage5_close_iterations'])
         
-        # 保存形态学处理后的图像用于调试
-        cv2.imwrite(os.path.join(self.output_dir, "morphology_result.png"), closed_image)
-        print(f"  形态学处理结果已保存到 morphology_result.png")
+        # 保存形态学处理后的图像（根据 cfg['debug'] 决定是否写盘）
+        if self.cfg.get('debug', False):
+            cv2.imwrite(os.path.join(self.output_dir, "morphology_result.png"), closed_image)
+            print(f"  形态学处理结果已保存到 morphology_result.png")
+        else:
+            print(f"  形态学处理结果已生成（未写入磁盘，debug=False）")
         self.morph_image = closed_image  # 保存 morphology 结果用于后续检测
         
         return closed_image
@@ -998,7 +839,10 @@ class TireOCR:
             print("处理完成: 未发现编号区域")
             return "无编号区域"
         
-        print(f"处理完成: 生成增强图像 {self.enhanced_image.shape}，已保存为 3_enhanced.png")
+        if self.cfg.get('debug', False):
+            print(f"处理完成: 生成增强图像 {self.enhanced_image.shape}，已保存为 3_enhanced.png")
+        else:
+            print(f"处理完成: 生成增强图像 {self.enhanced_image.shape}（未写入磁盘）")
         return "成功生成增强图像"
     
     def full_contours_pipeline(self, image_path: str) -> str:
@@ -1019,9 +863,10 @@ class TireOCR:
             print("第一阶段失败：未发现编号区域")
             return ""
         
-        # 可视化第一阶段结果
-        self.stage1_visualize()
-        print("第一阶段完成，生成: 1_binary.png, 2_roi.png, 3_enhanced.png, stage1_result.png")
+        if self.cfg.get('debug', False):
+            print("第一阶段完成，生成: 3_enhanced.png")
+        else:
+            print("第一阶段完成，增强图像已生成（未写入磁盘）")
         
         # 第二阶段：标签区域定位
         print("\n=== 第二阶段：标签区域定位 ===")
@@ -1030,9 +875,7 @@ class TireOCR:
             print("第二阶段失败：无法定位标签区域")
             return ""
         
-        # 可视化第二阶段结果
-        self.stage2_visualize()
-        print("第二阶段完成，生成: stage2_result.png")
+        print("第二阶段完成")
         
         # 第四阶段：形态学处理输出
         print("\n=== 第四阶段：形态学处理输出 ===")
@@ -1046,46 +889,6 @@ class TireOCR:
         else:
             print("第四阶段失败：形态学处理异常")
             return ""
-    
-    def run_and_visualize(self, image_path: str):
-        """
-        运行简化流程并可视化第一阶段结果
-        """
-        result = self.full_pipeline(image_path)
-        
-        # 只可视化第一阶段结果
-        if hasattr(self, 'original_image') and self.original_image is not None:
-            self.stage1_visualize()
-        
-        print(f"\n=== 处理完成 ===")
-        print(f"原始图像: {image_path}")
-        print(f"处理结果: {result}")
-        print(f"中间结果保存在: {self.output_dir}/")
-        print(f"关键输出: 3_enhanced.png (尺寸: {self.enhanced_image.shape if hasattr(self, 'enhanced_image') and self.enhanced_image is not None else 'N/A'})")
-        
-        return result
-    
-    def run_full_contours_pipeline(self, image_path: str):
-        """
-        运行完整轮廓检测流程并生成所有输出
-        """
-        result = self.full_contours_pipeline(image_path)
-        
-        if result:
-            print(f"\n=== 完整处理流程成功 ===")
-            print(f"处理状态: {result}")
-            print(f"所有输出文件保存在: {self.output_dir}/")
-            print(f"关键输出文件:")
-            print(f"  - 1_binary.png: 全局二值化图像")
-            print(f"  - 2_roi.png: 胎面区域图像")
-            print(f"  - 3_enhanced.png: 增强后图像")
-            print(f"  - stage1_result.png: 第一阶段可视化")
-            print(f"  - stage2_result.png: 第二阶段可视化")
-            print(f"  - morphology_result.png: 形态学处理结果")
-        else:
-            print(f"\n=== 处理失败 ===")
-        
-        return result
 
 
 def main():
@@ -1094,53 +897,124 @@ def main():
     
     # 检查参数
     if len(sys.argv) < 2:
-        print("用法: python tire_ocr.py <图像路径> [模式]")
+        print("用法: python tire_ocr.py <图像路径或目录> [模式]")
         print("示例:")
-        print("  python tire_ocr.py data/20250115083551210.png             # 默认运行完整流程（至形态学输出）")
-        print("  python tire_ocr.py data/20250115083551210.png simple     # 只运行第一阶段（ROI提取）")
-        print("  python tire_ocr.py data/20250115083551210.png full       # 运行完整流程（至形态学输出）")
+        print("  python tire_ocr.py data/                         # 遍历 data/ 下的 .bmp/.png 文件，运行完整流程")
+        print("  python tire_ocr.py 20250115083551210.bmp simple  # 只运行第一阶段（ROI提取）")
+        print("  python tire_ocr.py 20250115083551210.bmp full    # 运行完整流程（至形态学输出）")
         sys.exit(1)
-    
-    image_path = sys.argv[1]
-    mode = "full"  # 默认模式：完整流程
-    
+
+    path_arg = sys.argv[1]
+    mode = "full"
     if len(sys.argv) > 2:
         mode = sys.argv[2].lower()
-    
-    # 创建处理器
-    ocr = TireOCR()
-    
-    try:
-        if mode == "simple":
-            print("=== 运行简化流程（只处理第一阶段）===")
-            result = ocr.run_and_visualize(image_path)
-        elif mode == "full":
-            print("=== 运行完整流程（至形态学输出）===")
-            result = ocr.run_full_contours_pipeline(image_path)
-        else:
-            print(f"未知模式: {mode}，使用默认完整模式")
-            result = ocr.run_full_contours_pipeline(image_path)
-        
-        # 如果第一阶段失败（未生成增强图像），则直接结束并跳过后续处理
-        if ocr.enhanced_image is None:
-            print("检测到第一阶段失败：未发现编号区域，程序终止，跳过后续处理。")
-            return
 
-        # 处理完成后调用后处理脚本 post_vertical_projection.py（无参数）
+    # If a directory is provided, iterate its .bmp/.png files and process each.
+    def process_file(image_path: str, mode: str, preloaded_image: Optional[np.ndarray] = None):
+        display_name = image_path if isinstance(image_path, str) else '<in-memory>'
+        print(f"\n--- 处理文件: {display_name} (模式={mode}) ---")
+        ocr = TireOCR()
         try:
-            post_script = os.path.join(os.path.dirname(__file__), "post_vertical_projection.py")
-            if os.path.exists(post_script):
-                print("运行后处理脚本: post_vertical_projection.py")
-                subprocess.run([sys.executable, post_script], check=False)
+            # If preloaded_image is provided, pass it through to stage1 via the pipeline
+            entry = preloaded_image if preloaded_image is not None else image_path
+            if mode == "simple":
+                print("=== 运行简化流程（只处理第一阶段）===")
+                result = ocr.full_pipeline(entry)
             else:
-                print("未找到 post_vertical_projection.py，跳过后处理。")
-        except Exception as ex:
-            print(f"调用后处理脚本失败: {ex}")
-    except Exception as e:
-        print(f"处理失败: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+                print("=== 运行完整流程（至形态学输出）===")
+                result = ocr.full_contours_pipeline(entry)
+
+            if ocr.enhanced_image is None:
+                print("检测到第一阶段失败：未发现编号区域，跳过后续处理。")
+                return
+
+            # 尝试调用内置后处理（如果存在）——与之前逻辑相同
+            try:
+                post_mod_path = os.path.join(os.path.dirname(__file__), "post_vertical_projection.py")
+                if os.path.exists(post_mod_path):
+                    try:
+                        import post_vertical_projection as pvp
+                    except Exception:
+                        import importlib.util
+                        spec = importlib.util.spec_from_file_location("post_vertical_projection", post_mod_path)
+                        pvp = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(pvp)
+
+                    try:
+                        pvp.CFG['DEBUG_DRAW_SEGMENTS'] = ocr.cfg.get('debug', False)
+                    except Exception:
+                        pass
+
+                    morph_img = getattr(ocr, 'morph_image', None)
+                    enhanced_img = getattr(ocr, 'enhanced_image', None)
+                    if morph_img is None or enhanced_img is None:
+                        print("后处理跳过：缺少中间产物（morph_image 或 enhanced_image）")
+                    else:
+                        _, proj_morph = pvp.vertical_projection(morph_img, None)
+                        peaks_for_cut = pvp.detect_and_cluster_peaks(
+                            proj_morph,
+                            binary_thresh_factor=pvp.CFG.get("BINARY_THRESH_FACTOR", 0.02),
+                            merge_distance=pvp.CFG.get("MERGE_DISTANCE", 20),
+                            min_width=pvp.CFG.get("MIN_WIDTH", 5),
+                            gaussian_k=pvp.CFG.get("GAUSSIAN_KERNEL", 11),
+                            gaussian_sigma=pvp.CFG.get("GAUSSIAN_SIGMA", 2.0),
+                        )
+                        print(f"\nSegmenting characters using {len(peaks_for_cut)} peaks...")
+                        try:
+                            pvp.cut_characters(peaks_for_cut, os.path.join(ocr.output_dir, '3_enhanced.png'), os.path.join(ocr.output_dir, 'characters'))
+                        except TypeError:
+                            pvp.cut_characters(peaks_for_cut, enhanced_img, os.path.join(ocr.output_dir, 'characters'))
+                else:
+                    print("未找到 post_vertical_projection.py，跳过后处理。")
+            except Exception as ex:
+                print(f"内置后处理失败: {ex}")
+        except Exception as e:
+            print(f"处理文件失败: {display_name}, 错误: {e}")
+
+    if os.path.isdir(path_arg):
+        # gather bmp/png files
+        files = sorted(os.listdir(path_arg))
+        images = [os.path.join(path_arg, f) for f in files if f.lower().endswith(('.bmp', '.png'))]
+        if not images:
+            print(f"目录 {path_arg} 中未找到 .bmp 或 .png 文件")
+            sys.exit(1)
+
+        # Buffered producer-consumer: preload up to buffer_size images
+        buffer_size = 20
+        q = queue.Queue(maxsize=buffer_size)
+
+        def producer(file_list):
+            for fp in file_list:
+                try:
+                    img = cv2.imread(fp)
+                    if img is None:
+                        print(f"预加载失败，无法读取: {fp}")
+                        continue
+                    # block if queue full
+                    q.put((fp, img))
+                except Exception as ex:
+                    print(f"预加载出错: {fp}, {ex}")
+            # signal end
+            q.put(None)
+
+        prod_thread = threading.Thread(target=producer, args=(images,), daemon=True)
+        prod_thread.start()
+
+        # consume
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            fp, img = item
+            process_file(fp, mode, preloaded_image=img)
+        # ensure producer finished
+        prod_thread.join()
+    else:
+        # single file
+        if not os.path.exists(path_arg):
+            print(f"文件不存在: {path_arg}")
+            sys.exit(1)
+        process_file(path_arg, mode)
     
 
 

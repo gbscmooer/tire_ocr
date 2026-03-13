@@ -2,9 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+OCR
+batch_vertical_projection_time.py
+convert_to_html.py
 # C extensions
 *.so
+
 patch/
 # Distribution / packaging
 .Python
