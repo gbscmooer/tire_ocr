@@ -17,7 +17,7 @@ CFG = {
     # 投影/峰值检测基础阈值与平滑参数
     # BINARY_THRESH_FACTOR: 在增强后的投影上将小值置零时使用的相对阈值（相对于当前曲线最大值）
     #                阈值计算为 factor * max(projection)。较小值会保留更多弱峰，较大值会过滤弱噪声。
-    "BINARY_THRESH_FACTOR": 0.01,
+    "BINARY_THRESH_FACTOR": 0.02,
 
     # MERGE_DISTANCE: 在基于连通区间的分段处理中，如果两个连通区间之间的列距离小于该值，则会合并为同一区间。
     #                单位：像素列。用于消除因微小间隙导致的过度分割。
@@ -29,7 +29,7 @@ CFG = {
     # GAUSSIAN_KERNEL / GAUSSIAN_SIGMA: 用于对 1D 投影进行高斯平滑的核大小与标准差。
     #    GAUSSIAN_KERNEL: 必须为奇数，越大平滑越强、细节越少。单位：采样点（列或行）。
     #    GAUSSIAN_SIGMA: 高斯核的标准差，控制平滑程度（相对核宽）。
-    "GAUSSIAN_KERNEL": 9,
+    "GAUSSIAN_KERNEL": 5,
     "GAUSSIAN_SIGMA": 1.0,
 
     # SMOOTH_ZERO_THRESHOLD: 在对投影做非线性增强与局部对比度计算后，可用此绝对阈值把小值直接置零。
@@ -50,6 +50,10 @@ CFG = {
     "MIN_GAP": 8,            # 相邻峰间距小于此值则合并为一个峰（像素）
     "CHAR_SEP_GAP": 40,      # 相邻峰间距大于此值则强制分割（像素）
     "SPACE_THRESHOLD": 120,   # 相邻峰间距大于此值则认为空格（像素）
+    
+    # 鲁棒性检测相关参数
+    "ROBUSTNESS_THRESHOLD": 0.01,  # 连续低于此值则考虑切割（用于鲁棒性检测）
+    "ROBUSTNESS_MIN_GAP": 14,       # 连续低于阈值的最小像素数（用于鲁棒性检测）
 
     # PNG_COMPRESSION: 写入 PNG 时使用的 zlib 压缩级别（0-9）。
     #                  0 表示不压缩（最快），9 表示最大压缩（最慢但文件小）。
@@ -231,6 +235,7 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
     - 使用阈值把较小的值置零，按连通区间在区间内查找导数由正变负的位置作为峰点候选。
     - 丢弃过窄区间的噪声并在区间内取强度最大的点作为该区间的代表峰。
     - 合并距离小于 MIN_GAP 的相邻峰，取较高者的位置
+    - 增加鲁棒性检测：扫描平滑后的波形，对连续低于阈值的区域进行额外切割
 
     参数（可从 CFG 读取默认值）：
     - binary_thresh_factor: 二值阈值因子，阈值 = factor * max(projection)
@@ -366,6 +371,36 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
             if left_mean > 0.0 and right_mean < 0.0 and smoothed[j] >= float(binary_thresh_factor):
                 peaks.append((float(j), float(projection[j])))
 
+    # 添加鲁棒性切割逻辑：扫描1D高斯平滑后的波形图，
+    # 如果函数值小于ROBUSTNESS_THRESHOLD超过ROBUSTNESS_MIN_GAP px，那么在中点的位置进行一次切割（最高优先级）
+    robustness_threshold = float(CFG.get("ROBUSTNESS_THRESHOLD", 0.01))  # 连续低于此值则考虑切割
+    min_gap_for_cut = int(CFG.get("ROBUSTNESS_MIN_GAP", 8))             # 连续低于阈值的最小像素数
+    
+    # 扫描proj_smooth找连续低于robustness_threshold的区域
+    low_regions = []
+    j = 0
+    while j < len(proj_smooth):
+        if proj_smooth[j] < robustness_threshold:
+            start_low = j
+            while j < len(proj_smooth) and proj_smooth[j] < robustness_threshold:
+                j += 1
+            end_low = j - 1
+            gap_length = end_low - start_low + 1
+            if gap_length >= min_gap_for_cut:
+                # 在gap的中点位置添加一个切割点
+                mid_point = start_low + min_gap_for_cut // 2
+                low_regions.append(mid_point)
+        else:
+            j += 1
+    
+    # 将低值区域的中点作为额外的切割点添加到peaks中（最高优先级）
+    for mid_point in low_regions:
+        # 直接添加切割点，不检查与现有峰的距离（这是最高优先级规则）
+        peaks.append((float(mid_point), float(projection[mid_point])))
+    
+    # 按x坐标排序，确保峰值有序
+    peaks = sorted(peaks, key=lambda p: p[0])
+
     # 添加峰合并逻辑：合并距离小于 MIN_GAP 的相邻峰，取较高者的位置
     min_gap = int(CFG.get('MIN_GAP', 8))
     if len(peaks) > 1:
@@ -390,6 +425,188 @@ def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distan
             i = j
         
         peaks = merged_peaks
+
+    # 按x坐标排序
+    peaks = sorted(peaks, key=lambda p: p[0])
+
+    return peaks
+
+
+def detect_and_cluster_peaks(projection, binary_thresh_factor=None, merge_distance=None, min_width=None,
+                             gaussian_k=None, gaussian_sigma=None):
+    """基于导数过零点的波峰检测（包含高斯平滑、非线性增强与局部对比度增强）。
+
+    算法说明：
+    - 对输入的一维投影使用 1D 高斯核平滑以降低噪声。
+    - 对平滑结果做非线性压缩（gamma）并进行局部对比度增强，以提升低幅峰值。
+    - 使用阈值把较小的值置零，按连通区间在区间内查找导数由正变负的位置作为峰点候选。
+    - 丢弃过窄区间的噪声并在区间内取强度最大的点作为该区间的代表峰。
+    - 合并距离小于 MIN_GAP 的相邻峰，取较高者的位置
+    - 鲁棒性检测逻辑已移至字符分组阶段，因此此函数不再执行鲁棒性检测
+
+    参数（可从 CFG 读取默认值）：
+    - binary_thresh_factor: 二值阈值因子，阈值 = factor * max(projection)
+    - merge_distance: 保留以兼容但当前未显式使用
+    - min_width: 最小保留区间宽度（像素）
+    - gaussian_k: 高斯核大小（奇数）
+    - gaussian_sigma: 高斯核标准差
+
+    返回：列表，每项为 (x_peak, y_value)
+    """
+    if projection is None or projection.size == 0:
+        return []
+
+    max_val = float(np.max(projection))
+    if max_val <= 0:
+        return []
+
+    if binary_thresh_factor is None:
+        binary_thresh_factor = CFG.get("BINARY_THRESH_FACTOR", 0.02)
+    if merge_distance is None:
+        merge_distance = CFG.get("MERGE_DISTANCE", 20)
+    if min_width is None:
+        min_width = CFG.get("MIN_WIDTH", 5)
+    if gaussian_k is None:
+        gaussian_k = CFG.get("GAUSSIAN_KERNEL", 11)
+    if gaussian_sigma is None:
+        gaussian_sigma = CFG.get("GAUSSIAN_SIGMA", 2.0)
+
+    thresh = float(binary_thresh_factor) * max_val
+
+    # 1D Gaussian smoothing
+    k = int(gaussian_k)
+    if k % 2 == 0:
+        k += 1
+    half = k // 2
+    xs = np.arange(-half, half + 1)
+    gauss = np.exp(-(xs.astype(float) ** 2) / (2.0 * float(gaussian_sigma) ** 2))
+    gauss = gauss / np.sum(gauss)
+    proj_smooth = np.convolve(projection.astype(float), gauss, mode='same')
+
+    # 非线性重缩放 + 局部对比度增强
+    eps = 1e-8
+    smooth_max = float(np.max(proj_smooth))
+    if smooth_max <= 0:
+        return []
+    gamma = float(CFG.get("NONLINEAR_GAMMA", 0.65))
+    gamma = max(0.1, min(1.5, gamma))
+    # gamma < 1: 压缩高峰并抬升低峰，缓解动态范围过大
+    nonlinear = np.power(np.clip(proj_smooth / smooth_max, 0.0, 1.0), gamma)
+
+    w = int(CFG.get("LOCAL_CONTRAST_WINDOW", 81))
+    if w < 3:
+        w += 1
+    if w % 2 == 0:
+        w += 1
+    kernel = np.ones(w, dtype=float) / float(w)
+    local_mean = np.convolve(nonlinear, kernel, mode='same')
+    local_dev = np.convolve(np.abs(nonlinear - local_mean), kernel, mode='same')
+    enhanced = np.maximum(0.0, (nonlinear - local_mean) / (local_dev + eps))
+    enh_max = float(np.max(enhanced))
+    if enh_max > 0:
+        enhanced = enhanced / enh_max
+
+    # 阈值化：优先使用绝对阈值 SMOOTH_ZERO_THRESHOLD（如果设置），否则使用相对阈值 thresh
+    proc = enhanced.copy()
+    smooth_zero_thresh = CFG.get("SMOOTH_ZERO_THRESHOLD", None)
+    if smooth_zero_thresh is not None:
+        proc[proc < float(smooth_zero_thresh)] = 0.0
+    else:
+        proc[proc < float(binary_thresh_factor)] = 0.0
+
+    # 导数符号切换法：导数从正到负的位置作为候选峰值
+    # 使用可配置的窗口对导数取局部均值后判断符号变化，以提高在噪声下的鲁棒性
+    smoothed = enhanced
+    d = np.diff(smoothed)
+    peak_sign_window = int(CFG.get('PEAK_SIGN_WINDOW', 1))
+    if peak_sign_window < 1:
+        peak_sign_window = 1
+    peaks = []
+    n = len(smoothed)
+    i = 0
+
+    # 导数法在细字符场景下区间会偏窄，这里放宽最小宽度约束以避免漏检
+    effective_min_width = max(3, int(min_width) // 4)
+
+    # 先按阈值化后的非零区间遍历，再在区间内找导数过零点
+    while i < n:
+        if proc[i] == 0.0:
+            i += 1
+            continue
+        start = i
+        while i < n and proc[i] != 0.0:
+            i += 1
+        end = i - 1
+        if (end - start + 1) < effective_min_width:
+            continue
+
+        # 在 [start+1, end-1] 内找导数由正到负的点（对应峰索引 j）
+        local_peaks = []
+        lo = max(start + 1, 1)
+        hi = min(end - 1, n - 2)
+        for j in range(lo, hi + 1):
+            # 计算导数在左右窗口内的均值：左侧为 d[j-window .. j-1], 右侧为 d[j .. j+window-1]
+            left_start = max(0, j - peak_sign_window)
+            left = d[left_start:j] if j > left_start else np.array([], dtype=float)
+            right_end = min(len(d), j + peak_sign_window)
+            right = d[j:right_end] if right_end > j else np.array([], dtype=float)
+            left_mean = float(np.mean(left)) if left.size > 0 else 0.0
+            right_mean = float(np.mean(right)) if right.size > 0 else 0.0
+            if left_mean > 0.0 and right_mean < 0.0 and smoothed[j] > 0.0:
+                local_peaks.append(j)
+
+        if local_peaks:
+            # 一个连通区间可能有多个候选峰，取平滑值最大的那个
+            best_idx = max(local_peaks, key=lambda idx: smoothed[idx])
+        else:
+            # 平顶峰/弱噪声场景下兜底为区间最大值
+            seg_idx = int(np.argmax(smoothed[start:end + 1]))
+            best_idx = start + seg_idx
+
+        peaks.append((float(best_idx), float(projection[best_idx])))
+
+    # 兜底：若分段结果为空，则直接在全局平滑曲线上找导数由正到负且高于阈值的点
+    if not peaks:
+        # 全局兜底：在整个平滑曲线上应用窗口化的符号变化检测
+        for j in range(1, n - 1):
+            left_start = max(0, j - peak_sign_window)
+            left = d[left_start:j] if j > left_start else np.array([], dtype=float)
+            right_end = min(len(d), j + peak_sign_window)
+            right = d[j:right_end] if right_end > j else np.array([], dtype=float)
+            left_mean = float(np.mean(left)) if left.size > 0 else 0.0
+            right_mean = float(np.mean(right)) if right.size > 0 else 0.0
+            if left_mean > 0.0 and right_mean < 0.0 and smoothed[j] >= float(binary_thresh_factor):
+                peaks.append((float(j), float(projection[j])))
+
+    # 不再在此处进行鲁棒性检测，移至字符分组阶段
+
+    # 添加峰合并逻辑：合并距离小于 MIN_GAP 的相邻峰，取较高者的位置
+    min_gap = int(CFG.get('MIN_GAP', 8))
+    if len(peaks) > 1:
+        merged_peaks = []
+        i = 0
+        while i < len(peaks):
+            current_peak = peaks[i]
+            j = i + 1
+            
+            # 检查是否有相邻峰需要合并
+            while j < len(peaks):
+                next_peak = peaks[j]
+                if next_peak[0] - current_peak[0] <= min_gap:
+                    # 比较两个峰的高度，保留较高的
+                    if next_peak[1] > current_peak[1]:
+                        current_peak = next_peak  # 保留较高的峰
+                    j += 1
+                else:
+                    break
+            
+            merged_peaks.append(current_peak)
+            i = j
+        
+        peaks = merged_peaks
+
+    # 按x坐标排序
+    peaks = sorted(peaks, key=lambda p: p[0])
 
     return peaks
 
@@ -440,7 +657,7 @@ def find_peaks_from_smoothed(arr):
     return peaks_idx
 
 
-def run_knn_recognition(char_images=None):
+def run_knn_recognition(char_images=None, save_split_mode=False):
     """运行基于投影的表驱动识别（原先位于 KNN.py 中）。
 
     功能：扫描 `INPUT_CHARS_DIR` 目录中的字符图像（png/bmp），对每个字符计算横向/纵向投影、平滑、峰值检测，
@@ -465,7 +682,7 @@ def run_knn_recognition(char_images=None):
             spec.loader.exec_module(_ocr)
         else:
             raise ImportError(f"Cannot find ocr.py at {ocr_path}")
-    return _ocr.run_knn_recognition(char_images=char_images)
+    return _ocr.run_knn_recognition(char_images=char_images, save_split_mode=save_split_mode)
 
 
 
@@ -592,6 +809,35 @@ def cut_characters(peaks, src_image_path, out_dir, write_files=False):
     
     img_height, img_width = img.shape[:2]
     
+    # 重新计算投影用于鲁棒性检测
+    gray_img, projection = vertical_projection(img)
+    
+    # 对投影进行高斯平滑，用于鲁棒性检测
+    gaussian_k = CFG.get("GAUSSIAN_KERNEL", 11)
+    gaussian_sigma = CFG.get("GAUSSIAN_SIGMA", 2.0)
+    proj_smooth = smooth_projection(projection, gaussian_k=gaussian_k, gaussian_sigma=gaussian_sigma)
+    
+    # 鲁棒性检测：扫描平滑后的波形图，当连续有≥5个像素值低于0.01时，直接进行边界切割
+    robustness_threshold = float(CFG.get("ROBUSTNESS_THRESHOLD", 0.01))  # 连续低于此值则考虑切割
+    min_gap_for_cut = int(CFG.get("ROBUSTNESS_MIN_GAP", 5))             # 连续低于阈值的最小像素数
+    
+    # 扫描proj_smooth找连续低于robustness_threshold的区域
+    robust_split_points = []
+    j = 0
+    while j < len(proj_smooth):
+        if proj_smooth[j] < robustness_threshold:
+            start_low = j
+            while j < len(proj_smooth) and proj_smooth[j] < robustness_threshold:
+                j += 1
+            end_low = j - 1
+            gap_length = end_low - start_low + 1
+            if gap_length >= min_gap_for_cut:
+                # 在gap的中点位置作为直接切割点
+                split_point = start_low + min_gap_for_cut // 2
+                robust_split_points.append(int(split_point))
+        else:
+            j += 1
+    
     # 获取原始的峰信息用于分析
     peaks_sorted = sorted(peaks, key=lambda p: p[0]) if peaks else []
     
@@ -614,6 +860,49 @@ def cut_characters(peaks, src_image_path, out_dir, write_files=False):
             while j + 1 < len(peaks_sorted):
                 # 检查相邻峰间距
                 gap = peaks_sorted[j + 1][0] - peaks_sorted[j][0]
+                
+                # 首先检查是否需要在当前区域进行鲁棒性切割
+                # 在当前峰和下一个峰之间查找鲁棒性切割点
+                found_robust_split = False
+                for robust_point in robust_split_points:
+                    if peaks_sorted[j][0] < robust_point < peaks_sorted[j + 1][0]:
+                        # 找到鲁棒性切割点，立即在此处分割
+                        if i == 0:
+                            x_start = 0
+                        else:
+                            x_start = int((peaks_sorted[i - 1][0] + peaks_sorted[i][0]) / 2)
+                        
+                        # 鲁棒性切割点作为右边界
+                        x_end = robust_point
+                        
+                        if x_end <= x_start:
+                            x_end = min(img_width, x_start + 10)
+                        
+                        segments.append({
+                            'type': 'char',
+                            'x_start': x_start,
+                            'x_end': x_end,
+                            'peaks': collected_peaks
+                        })
+                        
+                        # 更新索引，继续处理下一个部分
+                        i = j + 1
+                        while i < len(peaks_sorted) and peaks_sorted[i][0] <= robust_point:
+                            i += 1
+                        
+                        if i >= len(peaks_sorted):
+                            # 所有峰都已处理
+                            found_robust_split = True
+                            break
+                            
+                        # 重新开始收集新段的峰
+                        collected_peaks = [peaks_sorted[i]]
+                        j = i
+                        found_robust_split = True
+                        break
+                
+                if found_robust_split:
+                    continue
                 
                 # 如果间隙大于空格阈值，需要在此处分割并插入空格
                 if gap > SPACE_THRESHOLD:
@@ -667,29 +956,31 @@ def cut_characters(peaks, src_image_path, out_dir, write_files=False):
                 j += 1
                 collected_peaks.append(peaks_sorted[j])
             
-            # 确定最终字符段边界
-            if i == 0:
-                x_start = 0
-            else:
-                x_start = int((peaks_sorted[i - 1][0] + peaks_sorted[i][0]) / 2)
-            
-            if j == len(peaks_sorted) - 1:
-                x_end = img_width
-            else:
-                x_end = int((peaks_sorted[j][0] + peaks_sorted[j + 1][0]) / 2)
-            
-            if x_end <= x_start:
-                x_end = min(img_width, x_start + 10)
-            
-            segments.append({
-                'type': 'char',
-                'x_start': x_start,
-                'x_end': x_end,
-                'peaks': collected_peaks
-            })
+            # 确定最终字符段边界（如果该段没有被鲁棒性检测提前分割）
+            if i < len(peaks_sorted) and not found_robust_split:  # 确保还有峰未处理且未被鲁棒性检测分割
+                if i == 0:
+                    x_start = 0
+                else:
+                    x_start = int((peaks_sorted[i - 1][0] + peaks_sorted[i][0]) / 2)
+                
+                if j == len(peaks_sorted) - 1:
+                    x_end = img_width
+                else:
+                    x_end = int((peaks_sorted[j][0] + peaks_sorted[j + 1][0]) / 2)
+                
+                if x_end <= x_start:
+                    x_end = min(img_width, x_start + 10)
+                
+                segments.append({
+                    'type': 'char',
+                    'x_start': x_start,
+                    'x_end': x_end,
+                    'peaks': collected_peaks
+                })
             
             # 更新状态，跳到下一个未处理的峰
-            i = j + 1
+            if not found_robust_split:  # 如果是由于鲁棒性检测导致的分割，i已经在上面更新了
+                i = j + 1
     
     # 如果启用调试模式，生成投影图
     if CFG.get('DEBUG_DRAW_SEGMENTS', False):
@@ -998,17 +1289,17 @@ def main():
     enhanced_path = 'output/3_enhanced.png'
     cut_dir = 'output/characters'
 
-    if os.path.exists(morphology_path) and os.path.exists(enhanced_path):
+    if os.path.exists(enhanced_path):  # 优先使用原始增强图像
         # 将图像读入内存（numpy 数组）并将数组传递给函数
-        morph_img = cv2.imread(morphology_path, cv2.IMREAD_GRAYSCALE)
         enhanced_img = cv2.imread(enhanced_path, cv2.IMREAD_GRAYSCALE)
 
-        if morph_img is None or enhanced_img is None:
+        if enhanced_img is None:
             print(f"[main] Skipping character cut: failed to read required images.")
         else:
-            _, proj_morph = vertical_projection(morph_img, None)
+            # 直接使用原始增强图像进行垂直投影（避免形态学处理破坏点阵字符）
+            _, proj_enhanced = vertical_projection(enhanced_img, None)
             peaks_for_cut = detect_and_cluster_peaks(
-                proj_morph,
+                proj_enhanced,
                 binary_thresh_factor=CFG["BINARY_THRESH_FACTOR"],
                 merge_distance=CFG["MERGE_DISTANCE"],
                 min_width=CFG["MIN_WIDTH"],
@@ -1030,7 +1321,7 @@ def main():
         if 'char_images' in locals() and char_images:
             print("Running in-file KNN recognition on in-memory images...")
             try:
-                run_knn_recognition(char_images=char_images)
+                run_knn_recognition(char_images=char_images, save_split_mode=False)
             except Exception as _knn_err:
                 print(f"run_knn_recognition() failed: {_knn_err}")
         else:
@@ -1038,7 +1329,7 @@ def main():
             if os.path.exists(cut_dir) and any(f.lower().endswith(('.png', '.bmp')) for f in os.listdir(cut_dir)):
                 print("Running in-file KNN recognition (from disk)...")
                 try:
-                    run_knn_recognition()
+                    run_knn_recognition(char_images=None, save_split_mode=False)
                 except Exception as _knn_err:
                     print(f"run_knn_recognition() failed: {_knn_err}")
             else:

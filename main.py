@@ -44,9 +44,9 @@ class TireOCR:
             'stage5_close_kernel': (1, 2),       # 调整为垂直方向连接
             'stage5_close_iterations': 1,
             'stage5_h_erosion_kernel': (3, 1),   # 横向腐蚀核：收缩点阵字符横向宽度
-            'stage5_h_erosion_iterations':4,    # 横向腐蚀迭代次数
+            'stage5_h_erosion_iterations':5,    # 横向腐蚀迭代次数
             'stage5_v_erosion_kernel': (1, 3),   # 纵向腐蚀核：收缩点阵字符纵向高度，分开纵向粘连
-            'stage5_v_erosion_iterations':3,    # 纵向腐蚀迭代次数
+            'stage5_v_erosion_iterations':4,    # 纵向腐蚀迭代次数
             
             # 轮廓过滤参数
             'contour_min_w': 8,
@@ -898,34 +898,36 @@ def main():
     
     # 检查参数
     if len(sys.argv) < 2:
-        print("用法: python tire_ocr.py <图像路径或目录> [模式] [-debug]")
+        print("用法: python tire_ocr.py <图像路径或目录> [模式] [-debug] [-s]")
         print("示例:")
         print("  python tire_ocr.py data/                         # 遍历 data/ 下的 .bmp/.png 文件，运行完整流程")
         print("  python tire_ocr.py 20250115083551210.bmp simple  # 只运行第一阶段（ROI提取）")
         print("  python tire_ocr.py 20250115083551210.bmp full    # 运行完整流程（至形态学输出）")
         print("  python tire_ocr.py 20250115083551210.bmp full -debug  # 运行完整流程并启用调试模式")
+        print("  python tire_ocr.py 20250115083551210.bmp full -debug -s  # 运行完整流程并保存分割字符到分类目录")
         sys.exit(1)
 
     path_arg = sys.argv[1]
     mode = "full"
     debug_mode = False
+    save_split_mode = False
     
-    # 检查是否包含 -debug 参数
-    if "-debug" in sys.argv:
+    # 检查是否包含 -debug 和 -s 参数
+    original_args = sys.argv[1:]  # 排除脚本名
+    if "-debug" in original_args:
         debug_mode = True
-        # 移除 -debug 参数，然后重新解析
-        args_copy = sys.argv[1:]  # 排除脚本名
-        args_copy = [arg for arg in args_copy if arg != "-debug"]
-        if len(args_copy) > 0:
-            path_arg = args_copy[0]
-        if len(args_copy) > 1:
-            mode = args_copy[1].lower()
-    else:
-        if len(sys.argv) > 2:
-            mode = sys.argv[2].lower()
+    if "-s" in original_args:
+        save_split_mode = True
+    
+    # 移除 -debug 和 -s 参数，然后重新解析
+    args_copy = [arg for arg in original_args if arg != "-debug" and arg != "-s"]
+    if len(args_copy) > 0:
+        path_arg = args_copy[0]
+    if len(args_copy) > 1:
+        mode = args_copy[1].lower()
 
     # If a directory is provided, iterate its .bmp/.png files and process each.
-    def process_file(image_path: str, mode: str, preloaded_image: Optional[np.ndarray] = None, debug_mode: bool = False):
+    def process_file(image_path: str, mode: str, preloaded_image: Optional[np.ndarray] = None, debug_mode: bool = False, save_split_mode: bool = False):
         display_name = image_path if isinstance(image_path, str) else '<in-memory>'
         print(f"\n--- 处理文件: {display_name} (模式={mode}) ---")
         ocr = TireOCR()
@@ -998,7 +1000,7 @@ def main():
                             if 'char_images' in locals() and char_images:
                                 print("Running in-file KNN recognition on in-memory images...")
                                 try:
-                                    pvp.run_knn_recognition(char_images=char_images)
+                                    pvp.run_knn_recognition(char_images=char_images, save_split_mode=save_split_mode)
                                 except Exception as _knn_err:
                                     print(f"run_knn_recognition() failed: {_knn_err}")
                             else:
@@ -1007,7 +1009,7 @@ def main():
                                 if os.path.exists(cut_dir) and any(f.lower().endswith(('.png', '.bmp')) for f in os.listdir(cut_dir)):
                                     print("Running in-file KNN recognition (from disk)...")
                                     try:
-                                        pvp.run_knn_recognition()
+                                        pvp.run_knn_recognition(save_split_mode=save_split_mode)
                                     except Exception as _knn_err:
                                         print(f"run_knn_recognition() failed: {_knn_err}")
                                 else:
@@ -1056,7 +1058,7 @@ def main():
             if item is None:
                 break
             fp, img = item
-            process_file(fp, mode, preloaded_image=img, debug_mode=debug_mode)
+            process_file(fp, mode, preloaded_image=img, debug_mode=debug_mode, save_split_mode=save_split_mode)
         # ensure producer finished
         prod_thread.join()
     else:
@@ -1064,7 +1066,7 @@ def main():
         if not os.path.exists(path_arg):
             print(f"文件不存在: {path_arg}")
             sys.exit(1)
-        process_file(path_arg, mode, debug_mode=debug_mode)
+        process_file(path_arg, mode, debug_mode=debug_mode, save_split_mode=save_split_mode)
     
 
 

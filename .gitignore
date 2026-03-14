@@ -151,7 +151,6 @@ data copy/
 
 # Log files
 *.log
-*.txt
 debug_*.png
 
 # Virtual environment
